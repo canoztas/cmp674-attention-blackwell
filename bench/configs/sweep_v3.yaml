@@ -1,0 +1,31 @@
+# V3 sweep config -- FP16 inputs / FP8 (E4M3) internal compute, per-tile scaling.
+#
+# Extends sweep_v2.yaml's grid to seq_len=16384. With FP8 inputs the per-block
+# SMEM footprint is half of V2's, so longer seq_lens fit comfortably; the
+# only growing memory footprint is the inputs/outputs themselves
+# (FP16 contract preserved across all variants for honest comparison).
+#
+# Memory budget at b=2, h=8, n=16384, d=128 (FP16 inputs, FP16 outputs):
+#   Q + K + V + O = 4 * (2*8*16384*128*2 bytes) = 256 MB. Fits 16 GiB.
+#
+# Variants run together: sdpa, v1_tiled_cu, v2_flash_cu, v3_flash_cu.
+# V0 dropped from this sweep because (a) V0 is FP32, separate precision class
+# (its sweep snapshot is in bench/results/v0_initial.parquet for the V0 paper
+# experiment) and (b) at seq_len=8192+ V0's O(N^2) materialization OOMs.
+#
+# warmup/iter: 50/100, same as sweep_v2.yaml. Total wall time scales with the
+# slowest variant (V1 at long seq_len); V3 should be at least as fast as V2
+# so doesn't extend the wall.
+
+sweep:
+  name: v3_initial
+  num_warmup: 50
+  num_iter: 100
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048, 4096, 8192, 16384]
+    head_dim: [64, 128]
+    batch_size: [2]
+    num_heads: [8]
+    dtype: ["torch.float16"]
+    causal: [false]
