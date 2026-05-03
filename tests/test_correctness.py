@@ -273,3 +273,146 @@ def test_v1_rejects_unsupported_head_dim() -> None:
     Q, K, V = _make_qkv_fp16(1, 1, 64, 32)
     with pytest.raises(RuntimeError, match=r"head_dim in \{64, 128\}"):
         attention_tiled_cu(Q, K, V, False)
+
+
+# --------------------------------------------------------------------------- #
+# V2 fused FlashAttention FP16 (online softmax + single-kernel fusion)        #
+# --------------------------------------------------------------------------- #
+
+try:
+    from v2_flash_fp16 import HAS_CUDA_EXT as _HAS_V2_CU_EXT
+    from v2_flash_fp16 import attention_flash_cu
+
+    HAS_V2_CU = _HAS_V2_CU_EXT
+    _V2_CU_IMPORT_ERR: str | None = (
+        None if _HAS_V2_CU_EXT else "compiled extension v2_flash_fp16._C not built"
+    )
+except ImportError as e:
+    HAS_V2_CU = False
+    _V2_CU_IMPORT_ERR = str(e)
+
+    def attention_flash_cu(*_a, **_kw):  # type: ignore[no-redef]
+        raise ImportError(_V2_CU_IMPORT_ERR)
+
+
+# V2 contract matches V1: head_dim in {64, 128}, FP16 in/out. The grid mirrors
+# V1's plus seq_len=32 (smaller than the BR=64 tile -> exercises the gr<N
+# masking on every row of the only tile). Causal kept in the cartesian product.
+_V2_SEQ_LENS = (32, 64, 100, 128, 256)
+_V2_HEAD_DIMS = (64, 128)
+_V2_BATCHES = (1, 2)
+_V2_NUM_HEADS = (1, 4)
+_V2_CAUSAL = (False, True)
+_V2_GRID = list(product(_V2_SEQ_LENS, _V2_HEAD_DIMS, _V2_BATCHES, _V2_NUM_HEADS, _V2_CAUSAL))
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("seq_len,head_dim,batch,num_heads,causal", _V2_GRID)
+def test_v2_cu_matches_v0_pt_fp16(
+    seq_len: int, head_dim: int, batch: int, num_heads: int, causal: bool
+) -> None:
+    """V2 (FP16, fused, online softmax) vs V0-PT (FP32) at FP16 tolerance.
+
+    V2 keeps softmax math entirely in FP32 registers / shared memory; the
+    only FP16 round-trips are the input loads, the P spill before the PV
+    matmul, and the final output write. So V2 should be at least as
+    accurate as V1 (which stored S, P in FP16 between phases). The same
+    ``atol=rtol=1e-2`` budget is the right reference - tighter would chase
+    rounding noise, looser would miss a real bug.
+    """
+    Q, K, V = _make_qkv_fp16(batch, num_heads, seq_len, head_dim)
+    out_v2 = attention_flash_cu(Q, K, V, causal)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), causal).half()
+    assert torch.isfinite(out_v2).all(), "V2 produced non-finite values"
+    torch.testing.assert_close(out_v2, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("causal", [False, True])
+def test_v2_cu_small_magnitude_inputs(causal: bool) -> None:
+    """Inputs with std=0.1: small softmax shifts. Catches first-iteration
+    edge cases (m_i = -inf init, alpha guard when m_new is also -inf)
+    that surface as NaNs only when scores are near-uniform.
+    """
+    Q, K, V = _make_qkv_fp16(2, 4, 256, 64, std=0.1)
+    out_v2 = attention_flash_cu(Q, K, V, causal)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), causal).half()
+    assert torch.isfinite(out_v2).all(), "V2 produced non-finite values at std=0.1"
+    torch.testing.assert_close(out_v2, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("std", [2.0, 3.0, 5.0])
+def test_v2_cu_no_overflow_under_high_variance(std: float) -> None:
+    """High-variance stress test: finite outputs + bulk correctness.
+
+    V2's online softmax holds m, l, and the output accumulator entirely in
+    FP32, so the FP16 cumulative-rounding regime that bit V1 at high std
+    is much tighter here. We expect V2 to outperform V1 numerically -
+    measured tail at std=5 should be well under V1's ~1.3% (the dominant
+    FP16 noise source is now just the FP16 P spill before the PV matmul).
+    Same 95%-within-5e-2 bulk-correctness threshold as V1; if that fails,
+    investigate (it would be a real bug, not noise).
+    """
+    Q, K, V = _make_qkv_fp16(2, 4, 256, 64, std=std)
+    out_v2 = attention_flash_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    assert torch.isfinite(out_v2).all(), f"V2 produced non-finite values at std={std}"
+    abs_err = (out_v2 - out_ref).abs()
+    within_band = (abs_err <= 5e-2).float().mean().item()
+    assert within_band >= 0.95, (
+        f"std={std}: only {within_band:.3%} of elements within 5e-2; "
+        f"max abs err = {abs_err.max().item():.3e}"
+    )
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+def test_v2_cu_long_seq_len_no_v1_materialization() -> None:
+    """seq_len=2048 at head_dim=64 is the regime V2 was built for: V1's
+    O(N^2) materialization of S in HBM is 4*16*2048*2048*2 bytes ~= 1 GiB
+    which fits, but stresses HBM bandwidth; V2 keeps S in registers/SMEM
+    and never writes it to HBM. Correctness here is what proves the
+    online softmax recurrence is right at scale.
+    """
+    Q, K, V = _make_qkv_fp16(1, 1, 2048, 64)
+    out_v2 = attention_flash_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    assert torch.isfinite(out_v2).all(), "V2 non-finite at seq_len=2048"
+    abs_err = (out_v2 - out_ref).abs()
+    within_band = (abs_err <= 5e-2).float().mean().item()
+    assert within_band >= 0.99, (
+        f"seq_len=2048: only {within_band:.3%} of elements within 5e-2"
+    )
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("seq_len", [1, 7, 16, 17])
+def test_v2_cu_tiny_and_subtile_seq_lens(seq_len: int) -> None:
+    """seq_len < BR (=64) and not aligned to WMMA_M (=16). The full Q tile
+    is loaded with rows >= seq_len zero-padded, then the scale+mask pass
+    sets S[gr>=N || gc>=N] to -inf so padded entries don't influence the
+    softmax. The epilogue's ``if (gr >= N) continue`` keeps us from
+    writing past the tensor end. Edge cases: seq_len=1 should output
+    exactly V[0] (single-token softmax is identity).
+    """
+    Q, K, V = _make_qkv_fp16(1, 1, seq_len, 64)
+    out_v2 = attention_flash_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    assert torch.isfinite(out_v2).all(), f"V2 non-finite at seq_len={seq_len}"
+    torch.testing.assert_close(out_v2, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+def test_v2_rejects_fp32_inputs() -> None:
+    """V2 must clearly reject non-FP16 inputs (binding-level guard)."""
+    Q, K, V = _make_qkv(1, 1, 64, 64)  # FP32 fixture
+    with pytest.raises(RuntimeError, match=r"V2 supports float16"):
+        attention_flash_cu(Q, K, V, False)
+
+
+@pytest.mark.skipif(not HAS_V2_CU, reason=f"v2_flash_fp16 extension not built: {_V2_CU_IMPORT_ERR}")
+def test_v2_rejects_unsupported_head_dim() -> None:
+    """V2 only supports head_dim in {64, 128}; D=32 must be rejected loudly."""
+    Q, K, V = _make_qkv_fp16(1, 1, 64, 32)
+    with pytest.raises(RuntimeError, match=r"head_dim in \{64, 128\}"):
+        attention_flash_cu(Q, K, V, False)

@@ -1,10 +1,10 @@
 """AOT build for the V2 FP16 fused (FlashAttention-style) attention extension.
 
-Stub: implemented in the V2 session. Boilerplate only — sm_120 explicit, the
-Windows-only ``-DUSE_CUDA`` macro for torch 2.9 + MSVC 14.40+ compatibility
-(see PyTorch PR #144707).
+sm_120 targeted explicitly; the Windows-only ``-DUSE_CUDA`` macro dodges the
+torch 2.9 + MSVC 14.40+ ``C2872 'std' ambiguous`` clash in
+``compiled_autograd.h`` (PyTorch PR #144707).
 
-V2 design target: fused QK -> online-softmax -> PV with no full (B, H, N, N)
+V2 implements fused QK -> online-softmax -> PV with no full (B, H, N, N)
 materialization in HBM. Reference: Dao 2022 (arXiv 2205.14135) and Dao 2023
 (arXiv 2307.08691) for FlashAttention and FlashAttention-2.
 """

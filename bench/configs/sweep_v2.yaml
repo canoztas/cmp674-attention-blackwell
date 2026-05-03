@@ -1,0 +1,32 @@
+# V2 sweep config - FP16, extends V1's grid to longer seq_lens.
+#
+# V2's whole point is O(N) HBM traffic instead of V1's O(N^2). The shape
+# regime where that pays off is large seq_len. seq_lens 4096 and 8192
+# stress V1 (S in HBM grows quadratically); V2 keeps S in registers/SMEM
+# and never writes it out. SDPA uses FlashAttention internally and tracks
+# V2 as the seq_len grows.
+#
+# (B, H) reduced from sweep_v1.yaml's (4, 16) to (2, 8) to leave headroom
+# at seq_len=8192:
+#   V1 S (FP16) at b=2, h=8, n=8192: 2*8*8192*8192*2 = 2.1 GiB - fits.
+#   V1 S (FP16) at b=4, h=16, n=8192: 8.6 GiB - tight on 16 GiB.
+# V1's prior sweep (sweep_v1.yaml) stays as the V0->V1 ablation snapshot;
+# this sweep is the V1->V2 long-seq comparison.
+#
+# warmup/iter: 50/100. Halved from V1's 100/200 because the longest configs
+# (V1 at seq_len=8192 ~= 210 ms/iter) would otherwise take ~40 s each.
+# 50/100 still gives statistically tight latency estimates (CV typically
+# < 2%) and keeps total wall time under ~5 min.
+
+sweep:
+  name: v2_initial
+  num_warmup: 50
+  num_iter: 100
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048, 4096, 8192]
+    head_dim: [64, 128]
+    batch_size: [2]
+    num_heads: [8]
+    dtype: ["torch.float16"]
+    causal: [false]

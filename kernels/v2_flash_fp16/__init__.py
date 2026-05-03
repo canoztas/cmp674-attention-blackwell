@@ -1,4 +1,9 @@
-"""V2 FP16 fused (FlashAttention-style) attention — Python entry point (stub)."""
+"""V2 FP16 fused (FlashAttention-style) attention — Python entry point.
+
+Online softmax + single-kernel fusion of QK^T, softmax, and PV. No
+materialization of the full (B, H, N, N) attention matrix in HBM. See
+``attention_v2.cu`` for the algorithmic details.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +17,7 @@ except ImportError:
 
 
 def attention_flash_cu(Q, K, V, causal: bool = False):
-    """Compiled V2 CUDA kernel — stub; raises until implemented."""
+    """Compiled V2 fused FlashAttention kernel."""
     if _attention_flash_cu is None:
         raise ImportError(
             "v2_flash_fp16._C is not built. Run "

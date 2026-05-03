@@ -43,7 +43,7 @@ runtime deps are not declared there.
 | --- | ----------- | --------------------------------------------------------------------- | ----------- |
 | V0  | FP32        | Naive — materializes the full N×N attention matrix in HBM             | **Done**    |
 | V1  | FP16        | Tiled, Tensor Core (hand-rolled WMMA), still materializes outputs     | **Done**    |
-| V2  | FP16        | Fused + online softmax (FlashAttention-style)                         | Pending     |
+| V2  | FP16        | Fused + online softmax (FlashAttention-style)                         | **Done**    |
 | V3  | FP8 (E4M3)  | V2 + per-tile scaling                                                 | Pending     |
 | V4  | FP4 (NVFP4) | V3 + microscaling (Blackwell-only, exploratory)                       | Pending     |
 
@@ -76,12 +76,13 @@ pip install -r env/requirements.txt
 # Build kernel extensions (editable, idempotent, AOT)
 pip install --no-build-isolation -e kernels/v0_naive_fp32
 pip install --no-build-isolation -e kernels/v1_tiled_fp16
+pip install --no-build-isolation -e kernels/v2_flash_fp16
 
-# Run all tests (217 expected)
+# Run all tests (310 expected)
 pytest
 
 # Run a single variant's correctness tests
-pytest tests/test_correctness.py -k v1
+pytest tests/test_correctness.py -k v2
 
 # Run V0 paper snapshot (FP32 sweep, V0-PT + V0-CU + SDPA)
 python bench/run_v0.py
@@ -91,12 +92,18 @@ python bench/run_all.py --variants sdpa v1_tiled_cu `
     --config bench/configs/sweep_v1.yaml `
     --output bench/results/v1_initial.parquet
 
+# Run V2 sweep (FP16, V1-CU + V2-CU + SDPA, extended to seq_len=8192)
+python bench/run_all.py --variants sdpa v1_tiled_cu v2_flash_cu `
+    --config bench/configs/sweep_v2.yaml `
+    --output bench/results/v2_initial.parquet
+
 # Generate figures
 python analysis/plot_v0_initial.py
 python analysis/plot_v1_vs_v0.py
+python analysis/plot_v2_vs_v1_v0.py
 
 # Verify Tensor Core engagement (no admin needed; reads cubin SASS)
-cuobjdump --dump-sass kernels/v1_tiled_fp16/_C.cp311-win_amd64.pyd | Select-String HMMA
+cuobjdump --dump-sass kernels/v2_flash_fp16/_C.cp311-win_amd64.pyd | Select-String HMMA
 ```
 
 ## Repository layout
@@ -107,8 +114,8 @@ cuobjdump --dump-sass kernels/v1_tiled_fp16/_C.cp311-win_amd64.pyd | Select-Stri
   helper: vcvars64.bat + `CUDA_HOME` + Nsight Compute on PATH + conda `gpu` activation.
   Dot-source it in shells where the user's `gpu` profile function isn't available.
 - `kernels/v{0..4}_<name>/` — one directory per variant. Each has its own `setup.py`
-  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. V0 and V1 are
-  implemented; V2–V4 are skeletons (compilable stubs that raise at runtime) so
+  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. V0, V1, and V2 are
+  implemented; V3–V4 are skeletons (compilable stubs that raise at runtime) so
   future sessions skip the boilerplate. Variant directories: `v0_naive_fp32`,
   `v1_tiled_fp16`, `v2_flash_fp16`, `v3_flash_fp8`, `v4_flash_nvfp4`.
 - [bench/harness.py](bench/harness.py) — core benchmarking machinery (CUDA event timing, p50/p95/p99,
@@ -119,7 +126,8 @@ cuobjdump --dump-sass kernels/v1_tiled_fp16/_C.cp311-win_amd64.pyd | Select-Stri
   the variant registry at startup and gracefully skips variants whose extension
   isn't built yet. Use this from V1 onwards.
 - `bench/configs/` — YAML sweep configs. `sweep_default.yaml` is FP32 (V0);
-  `sweep_v1.yaml` is the FP16 twin used by V1+ (same shape grid, different dtype).
+  `sweep_v1.yaml` is the FP16 twin used by V1 (same shape grid, different dtype);
+  `sweep_v2.yaml` extends to seq_len=8192 with smaller (B, H) for V2's long-seq story.
 - `bench/results/` — Parquet output (gitignored except `.gitkeep`).
 - [tests/test_correctness.py](tests/test_correctness.py) — every kernel ships with a passing correctness test
   against the PyTorch reference. **A kernel without a passing test does not get committed.**
@@ -151,18 +159,19 @@ cuobjdump --dump-sass kernels/v1_tiled_fp16/_C.cp311-win_amd64.pyd | Select-Stri
 
 ## Deferred work (do NOT do until the relevant variant session)
 
-- V2, V3, V4 implementations.
-- V0 / V1 optimization. V0 is intentionally slow and obvious; V1 picks
-  defensible tile defaults (BR=BC=BD=64) — tile-shape tuning is V2+ work.
+- V3, V4 implementations.
+- V0 / V1 / V2 optimization. V0 is intentionally slow and obvious; V1 picks
+  defensible tile defaults (BR=BC=BD=64); V2 keeps O accumulator in shared
+  memory across iterations rather than register-resident — this is the main
+  perf left on the table (see V2 lessons). Tile-shape tuning is V3+ work.
 - Tensor Core engagement profiling via Nsight Compute. Blocked on
   consumer-driver `ERR_NVGPUCTRPERM`; cubin SASS check (`cuobjdump | grep HMMA`)
   is sufficient through V2 and doesn't need admin.
-- Re-running V0 at higher iteration count for statistical parity with V1.
-  V0's 25-warmup / 100-iter snapshot is good enough for the figure; revisit
-  if a paper reviewer asks.
+- Re-running V0 / V1 at the V2 sweep grid (seq_len up to 8192) for full Pareto
+  curves. Current snapshots are at separate (B, H) for memory headroom.
 - CI / GitHub Actions.
 - CUTLASS, Transformer Engine, FlashInfer installs. Reconsider CUTLASS at
-  V2 (CollectiveEpilogue pays off for fused softmax).
+  V3 (FP8 epilogue scaling makes the install cost worthwhile; see V2 lessons).
 - Paper text. `paper/` stays empty until V3+.
 
 ## Reference papers (cite, don't re-read each session)
@@ -324,34 +333,152 @@ history. Read before starting V2.
   softmax + fused kernel — exactly what V2 introduces. V1 catching SDPA at
   this stage would have been a correctness-bug signal, not a victory.
 
+## Lessons from V2 session
+
+Captured before V3. Read these first; each one is a real-time-cost item that
+the code alone won't tell you.
+
+- **The CUTLASS-vs-WMMA decision held in WMMA's favor again, but for
+  different reasons.** V1's lesson said "CUTLASS at V2 if CollectiveEpilogue
+  pays off." It does in principle, but the install-and-verify cost on a
+  brand-new sm_120 toolchain is multi-hour yak shaving in a session that's
+  already algorithmically dense. V1's WMMA scaffolding (col_major K^T trick,
+  FP16 binding, dynamic SMEM idiom, sm_120 build) lifted verbatim. **V3 is
+  the natural CUTLASS migration point**: FP8 epilogue scaling (per-tile
+  scale factors threaded through the matmul output stage) is what
+  CollectiveEpilogue is actually for, and the install cost amortizes over
+  V3 + V4. Don't spend it earlier.
+- **Online softmax stability hinges on two corner cases that don't appear
+  in the paper's algorithm box.** (1) First iteration: m_i = -inf and l_i = 0;
+  m_i = 0 silently corrupts results when scores are negative (every
+  realistic input). (2) When an entire tile of scores is masked out for a
+  row (causal masking past the diagonal, or padded rows), m_new stays
+  -inf and the naive `alpha = exp(m_old - m_new)` becomes NaN. Guard:
+  `alpha = isfinite(m_new) ? __expf(m_old - m_new) : 1.0f;` and similarly
+  in the P = exp() pass. Combined with the deferred normalization (divide
+  by l only at the epilogue), these guards keep the recurrence robust;
+  V2 passed the small-magnitude-input test on the first build, which the
+  same kernel would have failed without the guards.
+- **Storing the O accumulator in shared memory between iterations is the
+  algorithmic correctness shortcut and the main perf compromise.** The
+  per-iteration update `O = alpha * O + P @ V` requires multiplying every
+  element of O by a per-row scalar alpha[r]. WMMA accumulator fragments
+  have implementation-defined per-thread layouts, so doing the alpha
+  rescale on register-resident fragments requires either knowing the layout
+  (FlashAttention's manual MMA PTX path) or using a shfl-based broadcast
+  scheme that depends on the layout. The shared-memory round trip
+  (store frag → SMEM → rescale → load SMEM → frag) is slower but correct
+  regardless of layout. Measured cost: V2 is only 1.0–1.5× V1 at long
+  seq_len despite the algorithmic improvement; SDPA is 4–7× V2 because
+  it does the register-resident update. **For V3, the register-resident
+  path is mandatory** — FP8 + per-tile scaling adds another rescale per
+  iteration that compounds the smem-traffic problem. CUTLASS handles this
+  via CollectiveEpilogue.
+- **The structural V2 win is memory, not latency.** At seq_len=8192,
+  head_dim=128, V1 peaks at 2176 MB (the N×N S tensor in HBM), V2 peaks
+  at 128 MB (matches SDPA exactly: just inputs + outputs). That's a 17×
+  reduction, and it's what makes seq_len=8192 even runnable on a 16 GB
+  card with non-trivial batch sizes. Lead with this in the paper; the
+  modest latency speedup is a secondary story.
+- **Dynamic SMEM opt-in is one line, but you need it.** V2's per-block
+  SMEM is 96 KB at HEAD_DIM=128 (Q + O + K/P alias + V + S). The default
+  cap is 48 KB; the launch silently fails without
+  `cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+  bytes)`. Cache the call with `static bool attr_set` so you don't re-pay
+  the API call every launch. RTX 5080 sm_120 supports up to ~99 KB
+  dynamic SMEM per block — fits 96 KB with a couple KB headroom. Don't
+  push past this for V3 without verifying the limit empirically.
+- **Templating by HEAD_DIM is worth a few extra lines.** V1 carries D as
+  a runtime int and dispatches to identical code paths. V2 templates by
+  HEAD_DIM ∈ {64, 128} so FRAG_BD = HEAD_DIM / WMMA_N is a compile-time
+  constant. Two effects: (1) the WMMA accumulator fragment array is
+  size-fixed (`fragment ... o_frag[FRAG_BD]`) which is required by C++
+  for register-resident arrays, and (2) the SMEM offset arithmetic is
+  fully constant-folded. Two instantiations cover the supported grid;
+  if D=256 or D=192 ever lands, add another template arg.
+- **Single fused kernel = fewer blocks, lower hardware utilization at
+  small N.** V2's grid is `(ceil(N/BR), B*H)` with one block doing all
+  K, V iterations sequentially. V1's QK grid is
+  `(ceil(N/BR), ceil(N/BC), B*H)` — one block per output tile. At
+  seq_len=512, head_dim=64, V1 wins because more blocks = better SM
+  occupancy; at seq_len=2048+ V2 catches up because per-block work
+  dominates. The crossover is around seq_len=1024 in our measurements.
+  This is expected and matches the FlashAttention papers — don't chase
+  it down as a bug.
+- **The cubin HMMA count for templated kernels is per-instantiation.**
+  cuobjdump emits the SASS for each instantiation separately. V2 emits
+  64 HMMAs for `flash_attention_fp16_kernel<64>` and 128 for
+  `<128>` — the count scales with the inner-D loop trip count
+  (D/WMMA_K iterations per warp). Total 192. Verify both instantiations
+  show HMMA, not just the count.
+- **Don't fight the WMMA fragment layout.** In V1 the QK^T matmul exposed
+  the col_major trick; in V2 the trickiest pattern is `load_matrix_sync`
+  for the accumulator fragment (loading O from SMEM into the o_frag) so
+  the next mma_sync accumulates onto the loaded values. This is supported
+  for accumulator fragments at the same layout used by store_matrix_sync
+  (mem_row_major in our case) — same layout in / out, no surprises.
+- **PowerShell wrap-and-pipe gotcha (carried over from V1):** when you
+  use `bash` to invoke `powershell -NoProfile -Command "...; ... | Select-...":`
+  the bash layer interprets the `|` as a pipe before powershell sees it.
+  Use the `PowerShell` tool directly when you need to pipe inside a
+  PowerShell command — or, when invoking via `Bash`, wrap the entire
+  thing including pipes in the `-Command` quoted argument. This bit twice
+  in the V2 session before I switched to the `PowerShell` tool for
+  inspection commands.
+
 ## Current status
 
-**Session 2 — V1 complete + V0 preserved + V2–V4 still stubs.** All 217 pytest
-tests pass: 147 V0 (unchanged) + 70 V1 (V0-PT FP32 reference at atol=1e-2 on
-the V1 grid + causal + non-aligned seq_len + small-magnitude adversarial +
-high-variance stress tests + dtype/head_dim rejection). V1-CU
-(`kernels/v1_tiled_fp16/`) builds for sm_120 via `pip install -e`; 152 HMMA
-Tensor Core instructions in the cubin (120 in `qk_tile_kernel`, 32 in
-`pv_tile_kernel`, 0 in softmax). Sweep produced 3200 rows in
-`bench/results/v1_initial.parquet` (16 (variant, config) results × 200
-iterations of V1 + SDPA on FP16); figure at `analysis/figures/v1_vs_v0.png`
-shows V1 8.3–8.6× V0 at seq_len=2048.
+**Session 3 — V0 + V1 + V2 implemented; V3 + V4 still stubs.** 310 pytest
+tests pass: 147 V0 (unchanged) + 70 V1 (unchanged) + 92 V2 + 1 harness. V2-CU
+(`kernels/v2_flash_fp16/`) builds for sm_120 via `pip install -e`; 192 HMMA
+Tensor Core instructions across the two HEAD_DIM template instantiations
+(64 for `<64>`, 128 for `<128>`).
 
-V2–V4 directories remain compilable stubs. `bench/run_all.py` resolves the
-registry at startup and runs cleanly with V0 + V1 + SDPA today, gracefully
-skipping V2–V4 stubs. Build-env helper at
-[env/activate_for_build.ps1](env/activate_for_build.ps1) handles
-non-interactive PowerShell sessions (the user's `gpu` profile function
-covers terminal use).
+V2 algorithmic state: online softmax with running (m, l) per row, single
+fused kernel (Q@K^T → softmax → P@V) with no full N×N materialization. O
+accumulator in SMEM (FP32) across iterations; running stats in static
+`__shared__` arrays. Per-iteration update via store-frag → SMEM rescale by
+alpha → load-frag-back, accumulate via mma_sync, store-frag again.
+Templated by HEAD_DIM ∈ {64, 128}. Dynamic SMEM opt-in via
+`cudaFuncSetAttribute` (96 KB at HEAD_DIM=128).
 
-**Next session — V2.** FlashAttention-style: online softmax + single-kernel
-fusion, FP16 in/out, FP32 accumulators. First action: re-run
-`. .\env\activate_for_build.ps1; python env/check_env.py` (10/10 PASS expected),
-then `pip install -e kernels/v2_flash_fp16` to confirm the stub builds. Then
-decide CUTLASS vs hand-rolled WMMA again — V2 is where CUTLASS's
-`CollectiveEpilogue` advantage actually pays off, so the trade-off rebalances
-in CUTLASS's favor. If CUTLASS is chosen, install as a git submodule under
-`external/cutlass/` and verify a minimal sm_120 GEMM example before writing
-the V2 body.
+Sweep at `bench/results/v2_initial.parquet` (3600 rows: 36 (variant, config)
+pairs × 100 iterations of V1 + V2 + SDPA on FP16 across seq_len ∈ {128…8192},
+head_dim ∈ {64, 128}, b=2, h=8). Figure at `analysis/figures/v2_vs_v1_v0.png`.
+
+Headline numbers at seq_len=8192, head_dim=128:
+- Latency: V1 = 75.6 ms, V2 = 58.8 ms, SDPA = 12.5 ms (V2 is 1.29× V1; SDPA is 4.7× V2)
+- Peak memory: V1 = 2176 MB, V2 = 128 MB, SDPA = 128 MB (V2 is 17× lower than V1)
+
+The latency gap between V2 and SDPA is the cost of the SMEM-resident O
+accumulator vs. the register-resident path SDPA / FlashAttention use.
+That's the V3+ design lever (CUTLASS CollectiveEpilogue + FP8 = the move).
+
+V3 + V4 directories remain compilable stubs. `bench/run_all.py` resolves
+the registry at startup and runs cleanly across V0 + V1 + V2 + SDPA today,
+gracefully skipping V3 + V4 stubs.
+
+**Next session — V3 (FP8 / E4M3).** Per-tile scaling on top of V2's fused
+structure. First-actions checklist:
+
+1. `. .\env\activate_for_build.ps1; python env/check_env.py` (10/10 PASS).
+2. `pip install -e kernels/v3_flash_fp8` to confirm the stub still builds.
+3. Re-litigate WMMA vs CUTLASS one more time. **CUTLASS is the right call
+   for V3** because (a) FP8 epilogue scaling is exactly what
+   `CollectiveEpilogue` exists for, (b) V2's SMEM-resident O accumulator
+   is the perf wall and CUTLASS's register-resident epilogue is the way
+   through it, (c) CUTLASS Blackwell sm_120 FP8 GEMM examples have been
+   landing through 2025–2026 and should be runnable now. Install as a git
+   submodule under `external/cutlass/`, verify the FP8 sm_120 example
+   from `examples/` runs end-to-end before touching V3 code.
+4. If CUTLASS sm_120 FP8 still isn't ready, fall back to hand-rolled
+   FP8 with `__nv_fp8_e4m3` and per-tile scale factors carried alongside
+   the M, L running stats. This is a real risk; budget time accordingly.
+5. Numerical envelope: FP8 E4M3 has ~4-bit mantissa, so per-tile scaling
+   is mandatory (a single global scale would saturate). Per-tile = one
+   scale per BR×BC block of S, propagated through the softmax and PV.
+   Test grid should include the same high-variance regime that V1 / V2
+   stress, with looser tolerance (probably atol=5e-2 not 1e-2 — verify
+   from the FP8 paper and the SageAttention3 paper, both cited above).
 
 Update this section at the end of every session.
