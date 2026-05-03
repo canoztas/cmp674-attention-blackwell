@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# IDEs
+.vscode/
+.idea/
+
+# Benchmark outputs (directory kept via .gitkeep)
+bench/results/*.parquet
+
+# Profiler reports
+*.ncu-rep
+*.nsys-rep
+
+# Notebooks
+.ipynb_checkpoints/

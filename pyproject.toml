@@ -1,0 +1,56 @@
+# Project metadata + tooling configuration only.
+# Runtime dependencies are pinned in env/requirements.txt and installed inside the
+# shared `gpu` venv with `pip install -r env/requirements.txt`.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attention-blackwell"
+version = "0.0.1"
+description = "Mixed-precision attention kernel benchmarks on NVIDIA RTX 5080 (Blackwell, sm_120)"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.setuptools]
+# Top-level project is documentation + scripts; per-variant kernel extensions are
+# installed individually from kernels/v{N}_<name>/ via their own setup.py.
+packages = []
+
+# ---- ruff ----
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",  # line length handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["N802", "N806"]  # allow non-snake_case names in tests (e.g. Q, K, V)
+
+# ---- black ----
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+# ---- pytest ----
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "cuda: requires a CUDA device",
+]
