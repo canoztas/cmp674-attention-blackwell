@@ -22,7 +22,7 @@ dist/
 bench/results/*.parquet
 bench/results/*.log
 
-# LaTeX build artifacts (paper/main.pdf IS committed)
+# LaTeX build artifacts (paper/main.pdf and slides/lesson.pdf ARE committed)
 paper/main.aux
 paper/main.bbl
 paper/main.blg
@@ -32,6 +32,17 @@ paper/main.log
 paper/main.out
 paper/main.toc
 paper/main.synctex.gz
+slides/lesson.aux
+slides/lesson.fdb_latexmk
+slides/lesson.fls
+slides/lesson.log
+slides/lesson.nav
+slides/lesson.out
+slides/lesson.snm
+slides/lesson.toc
+slides/lesson.vrb
+slides/lesson.synctex.gz
+slides/lesson_preview*.png
 
 # Profiler reports
 *.ncu-rep

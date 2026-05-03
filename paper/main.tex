@@ -20,6 +20,7 @@
 \usepackage{listings}
 \usepackage[hidelinks]{hyperref}
 \usepackage{url}
+\usepackage{array}
 
 \sisetup{
   detect-all,
@@ -52,28 +53,26 @@ A Pareto Replication Study from FP32 to NVFP4 on the RTX~5080}
 \maketitle
 
 \begin{abstract}
-We present a systematic Pareto replication study of mixed-precision
-attention on the NVIDIA GeForce RTX~5080 (Blackwell, sm\_120a)---a
-mid-tier consumer GPU underrepresented in published kernel-level
-attention work. Five hand-rolled kernels spanning FP32 to NVFP4 share a
-single algorithmic skeleton (online softmax, single-kernel fusion,
-register-resident accumulator from V3 onward), so each step in the
-optimization ladder isolates one variable. We report three findings:
-(i)~adding online softmax and fusion reduces peak HBM at sequence
-length 8192 by $17\times$, exactly matching the PyTorch SDPA baseline
-without changing precision; (ii)~hand-rolled FP8 (V3) closes
-approximately half of the SDPA latency gap, confirming that custom
-kernels using a precision the vendor library does not engage---SDPA on
-this PyTorch~2.9 build dispatches only to a math fallback---expose a
-real hardware lever; and (iii)~NVFP4 (V4) with software microscaling on
-\texttt{kind::f8f6f4.m16n8k32} is $\approx 30\%$ \emph{slower} than V3,
-because the per-mma microscaling overhead exceeds the FP4 throughput
-advantage at the consumer-Blackwell software stack we target. The
-hardware-microscaled \texttt{mxf4nvf4.m16n8k64} family would plausibly
-invert this result but is incompatible with the row-major-SMEM idiom we
-share with V3, and we treat it as documented future work. Our open
-artifact is reproducible on a single 16~GB consumer GPU and includes
-full benchmark drivers, kernels, and figure regeneration.
+We replicate a decade of attention-kernel optimizations on the NVIDIA
+RTX~5080, a mid-tier consumer Blackwell GPU underrepresented in
+published kernel-level work. Five hand-rolled kernels share a common
+algorithmic skeleton---tile streaming with online softmax---and differ
+only in numerical precision and one optimization at a time, so each
+step in the ladder isolates exactly one variable. We report three
+findings. First, fusing the kernel and adopting online softmax cuts
+peak HBM at sequence length 8192 by $17\times$, exactly matching
+PyTorch's SDPA baseline, with no precision change. Second, a hand-rolled
+FP8 kernel using \texttt{mma.sync m16n8k32} closes about half of the
+remaining latency gap to SDPA, exploiting a hardware lever the vendor
+library does not engage on this software stack. Third---and contrary to
+the prevailing assumption that lower precision always wins---NVFP4 with
+software microscaling is roughly $30\%$ \emph{slower} than FP8: the
+per-mma scaling cost dominates the FP4 throughput advantage. The
+hardware-microscaled NVFP4 path would plausibly invert this result, but
+its scattered-fragment layout is incompatible with the row-major SMEM
+idiom shared by our other variants, and we treat it as deferred work.
+The full benchmark, kernels, and figure regeneration are reproducible
+on a single 16~GB consumer GPU.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -85,501 +84,744 @@ Tensor Cores, consumer Blackwell, sm\_120a, reproducibility
 \section{Introduction}
 \label{sec:intro}
 
-Scaled dot-product attention is the dominant compute and memory cost in
-contemporary transformer inference. Its quadratic dependence on sequence
-length has motivated a decade of kernel-level optimization---tiling,
-fusion, online softmax, and progressively narrower numerical
-precisions---that has compressed both wall-clock latency and high-
-bandwidth-memory (HBM) footprint by more than an order of magnitude on
-datacenter GPUs.
+Attention is the dominant cost in modern transformer inference, both in
+compute and in memory. Its quadratic dependence on sequence length has
+driven a decade of kernel-level optimizations: tiling, fusion, online
+softmax, and progressively narrower numerical formats. On datacenter
+GPUs (H100, B100, B200), each of these ideas has been validated
+independently, often more than once. On the flagship consumer card
+(RTX~5090), recent work confirms that the optimizations transfer.
 
-The two largest individual contributions to this trajectory are the
-\emph{FlashAttention} family~\cite{dao2022flashattention,dao2024flashattention2,shah2024flashattention3},
-which replaces the materialized $N \times N$ attention matrix with a
-single fused, tile-streaming kernel, and the \emph{mixed-precision
-attention} literature~\cite{micikevicius2022fp8,zhang2025sageattention3},
-which exploits 5\textsuperscript{th}-generation Tensor Cores' native FP8
-and FP4 arithmetic. Each of these ideas has been independently validated
-on Hopper (H100) and on the top-of-stack Blackwell datacenter parts
-(B100/B200, sm\_100a) and on the flagship consumer Blackwell card
-RTX~5090 (sm\_120a)~\cite{zhang2025sageattention3}.
-
-A gap remains. The bulk of academic and industrial interest in
-\emph{consumer} Blackwell has fixated on the RTX~5090. The mid-tier
-RTX~5080 (sm\_120a, 84 SMs, 16~GB GDDR7, $\approx$960~GB/s) is the actual
+The mid-tier consumer card---the RTX~5080---has received much less
+attention. It shares a compute capability (sm\_120a) with the 5090 but
+differs on every other dimension that matters for kernel design: half
+the SM count, a narrower memory bus, and a tighter VRAM ceiling. As a
 practical inference target for individual researchers, small labs, and
-edge-deployed serving stacks; it shares a compute capability with the
-5090 but has materially different SM count, L2 capacity, and memory
-bandwidth, and---as we document---a different software-stack story for
-GPU-attention dispatch on Windows. Whether the FlashAttention algorithmic
-gains, FP8 throughput benefits, and FP4 microscaling promises
-\emph{transfer} to this constrained-but-realistic platform is unstudied.
+edge deployments, it is arguably the more important platform. As an
+object of academic study, it is essentially absent from the literature.
 
-\paragraph*{Contribution} We perform a systematic Pareto replication
-study of mixed-precision attention on the RTX~5080 (Blackwell, sm\_120a)
-across five hand-rolled kernels spanning FP32 to NVFP4, all compiled to
-machine code on the same toolchain (CUDA~12.8, PyTorch~2.9.1, sm\_120a)
-and benchmarked against pinned PyTorch SDPA backends. The kernels share
-a single algorithmic skeleton---online softmax with single-kernel
-fusion---so each step in the precision and optimization ladder isolates
-exactly one variable. Specifically:
+\subsection*{What this paper does}
+
+We perform a controlled, ladder-style replication of mixed-precision
+attention on the RTX~5080. We hand-roll five attention kernels that
+share one algorithmic skeleton---tile streaming with online softmax,
+single-kernel fusion, and (from the third kernel onward) a register-
+resident output accumulator---and that differ only in numerical
+precision and one specific optimization at a time. The kernels are:
+
 \begin{itemize}
-  \item \textbf{V0 (FP32 naive):} correctness oracle, full $O(N^2)$
-        materialization in HBM.
-  \item \textbf{V1 (FP16 tiled):} hand-rolled WMMA, but still
-        materializes the score and probability matrices in HBM. Isolates
-        \emph{tiling and Tensor-Core engagement} from algorithmic
-        fusion.
-  \item \textbf{V2 (FP16 fused):} FlashAttention-style online softmax,
-        single-kernel fusion. Isolates \emph{algorithmic fusion's}
-        contribution.
-  \item \textbf{V3 (FP8, E4M3):} hand-rolled \texttt{mma.sync m16n8k32}
-        inline PTX with per-tile FP8 scaling and a register-resident
-        output accumulator. Isolates \emph{narrower-precision Tensor
-        Cores} on consumer Blackwell, where the CUTLASS sm\_120a FMHA
-        reference does not exist as of v4.4.2~\cite{nvidia2024cutlass}.
-  \item \textbf{V4 (NVFP4, E2M1):} per-row, per-K-block (block size 32)
-        software microscaling on the
-        \texttt{kind::f8f6f4.m16n8k32.e2m1.e2m1.f32} mma.
+  \item \textbf{V0 (FP32, naive).} Three separate kernel launches with
+        the full $N\times N$ score and probability matrices materialized
+        in HBM. Serves as the \emph{correctness oracle} and as the
+        worst-case latency/memory baseline.
+  \item \textbf{V1 (FP16, tiled).} Same three-launch structure as V0,
+        but with FP16 inputs and Tensor-Core matmuls via the
+        \texttt{nvcuda::wmma} API. Isolates the contribution of
+        \emph{tiling and Tensor-Core engagement} alone.
+  \item \textbf{V2 (FP16, fused).} Single fused kernel with the online
+        softmax recurrence; no longer materializes the score or
+        probability matrices in HBM. Isolates \emph{algorithmic
+        fusion}.
+  \item \textbf{V3 (FP8, fused).} Hand-rolled FP8 (E4M3) kernel using
+        inline-PTX \texttt{mma.sync.m16n8k32}, with a register-resident
+        output accumulator and per-tile FP8 scaling. Isolates
+        \emph{narrower-precision Tensor Cores}.
+  \item \textbf{V4 (NVFP4, fused).} Same structure as V3, with the FP8
+        mma replaced by the FP4 (E2M1) sync mma and software-managed,
+        per-row, per-K-block microscaling. Isolates \emph{FP4
+        precision}.
 \end{itemize}
 
-\paragraph*{Findings} Three results stand out, two confirmatory and one
-negative:
+This ladder is constructed so that each step changes exactly one design
+choice. The performance and accuracy delta at each step therefore
+quantifies the contribution of that one choice on this hardware, with
+no confounding.
+
+\subsection*{Three findings}
+
+Of the four steps in the ladder, two confirm the published trajectory,
+one reveals an underappreciated software-stack confound, and one is a
+clean negative result.
+
+\textbf{The memory wall breaks at V2.} Adding online softmax and fusion
+reduces peak HBM at sequence length 8192 from 2,176~MB to 128~MB---a
+$17\times$ reduction that exactly matches the SDPA baseline---without
+any precision change. The full $N\times N$ probability matrix is the
+problem; once it stops being materialized, the memory footprint
+collapses to the input/output footprint, and a 16~GB consumer card
+becomes capable of sequence lengths it could not previously fit.
+
+\textbf{V3 closes about half the SDPA gap with FP8.} V3 is $2.4\times$
+faster than V2 and reaches roughly half of SDPA's throughput. This is
+not because V3 has a better algorithm than the vendor library; it does
+not. It is because the SDPA implementation that ships with PyTorch on
+this stack \emph{does not} engage FP8 Tensor Cores at all---it
+dispatches to a pair of cuBLAS matmuls with a softmax in between
+(Section~\ref{sec:exp}). A custom kernel that uses a precision the
+vendor library does not engage exposes a real hardware lever, even
+when the algorithm is otherwise unchanged.
+
+\textbf{V4 loses to V3 by $\approx 30\%$.} On the consumer-Blackwell
+software stack we target, the per-mma overhead of software microscaling
+exceeds the FP4 throughput advantage. This is the first quantitative
+evidence we are aware of that low-precision attention is not strictly
+Pareto-dominant on consumer Blackwell, in contrast to the purely
+positive findings reported on H100 and RTX~5090. The hardware-
+microscaled NVFP4 instruction family would likely invert the result,
+but engaging it requires a different shared-memory layout we share
+between V3 and V4, and we document this as deferred work.
+
+\subsection*{Contributions versus prior work}
+
+We do not introduce a new attention algorithm. The algorithmic
+skeleton (online softmax, single-kernel fusion) is from
+FlashAttention~\cite{dao2022flashattention}; the FP8 forward-pass
+recipe is from Micikevicius et al.~\cite{micikevicius2022fp8}; the FP4
+microscaling format is the OCP/NVFP4 standard, demonstrated on RTX~5090
+by SageAttention3~\cite{zhang2025sageattention3}. What we add is:
+
 \begin{enumerate}
-  \item \textbf{Memory wall breaks at V2.} Adding online softmax and
-        fusion reduces peak HBM at sequence length 8192 from 2176~MB to
-        128~MB---a $17\times$ reduction that exactly matches the SDPA
-        baseline---without any precision change.
-  \item \textbf{V3 closes a measurable share of the SDPA latency gap
-        with FP8.} V3 is $2.4\times$ faster than V2 and reaches roughly
-        half of SDPA's throughput, even though SDPA on this PyTorch
-        build dispatches only to a math fallback (Section~\ref{sec:exp}).
-        Custom kernels using a precision the vendor library does not
-        engage expose a real hardware lever.
-  \item \textbf{V4 loses to V3 by $\approx 30\%$.} On consumer Blackwell,
-        software microscaling overhead dominates the FP4 throughput
-        advantage at the \texttt{mma.sync} call granularity. The
-        hardware-microscaled \texttt{mxf4nvf4.m16n8k64} family would
-        plausibly invert this result, but its CuTe scattered-fragment
-        layout is incompatible with the row-major SMEM idiom used by V3.
-        We document this as a deferred-work design lever.
+  \item \emph{A controlled five-point ablation} that isolates the
+        contribution of each step in the optimization ladder on a
+        single hardware/software stack. Existing FP4 attention
+        papers~\cite{zhang2025sageattention3,zhang2026attnqat} present
+        a single optimized kernel and compare against external
+        baselines; the per-step contribution of fusion, FP8, and FP4
+        is not separable from their results. Our ladder makes each
+        step measurable.
+  \item \emph{The first kernel-level mixed-precision attention study
+        on the RTX~5080.} The RTX~5080 is included in
+        SlideSparse~\cite{shao2026slidesparse} as a sparse-GEMM
+        evaluation platform but not as an attention-kernel target;
+        Knoop and Holtmann's broader consumer-Blackwell
+        study~\cite{knoop2026consumerllm} explicitly omits the 5080
+        in favor of the 5060~Ti, 5070~Ti, and 5090. Our V4 differs
+        from SageAttention3 in three concrete ways
+        (Section~\ref{sec:related}): SKU, mma instruction family, and
+        ablation framing.
+  \item \emph{A negative result on FP4 microscaling overhead.}
+        SageAttention3 reports FP4 wins on RTX~5090 using the
+        hardware-microscaled \texttt{mxf4nvf4} mma; we measure that
+        when the same precision is forced through the
+        software-microscaled \texttt{kind::f8f6f4} path---which is
+        the only path compatible with row-major SMEM access---the
+        per-mma overhead reverses the win. To our knowledge this is
+        the first quantitative evidence that FP4 attention is not
+        strictly faster than FP8 attention on consumer Blackwell, and
+        it complements the failure-mode literature~%
+        \cite{zhang2026attnqat,qiu2025lowprecisionfails,zhang2026snapmla}
+        that documents why FP4 attention is hard.
+  \item \emph{A backend-dispatch finding with methodological
+        consequences.} On the PyTorch~2.9.1+cu128 Windows wheel we
+        test, SDPA falls through to the \texttt{MATH} backend for
+        sm\_120 / FP16 / non-causal inputs---attempts to pin
+        \texttt{FLASH\_ATTENTION} or \texttt{CUDNN\_ATTENTION} are
+        rejected at runtime. The performance baseline an end user sees
+        is therefore not FlashAttention-2 on this stack. Existing
+        attention papers comparing against ``SDPA'' without naming the
+        dispatch are liable to mis-attribute speedups. We argue this
+        is a community-wide methodology gap and recommend an explicit
+        pinning convention.
 \end{enumerate}
 
-The negative V4 result is, to our knowledge, the first quantitative
-evidence that low-precision attention does not strictly win on consumer
-Blackwell hardware, in contrast to the purely positive findings reported
-on H100 and RTX~5090. Together with the SDPA-dispatch finding, this
-argues for treating each Blackwell tier as a distinct study target rather
-than extrapolating from a single hardware reference.
-
-\paragraph*{Roadmap} Section~\ref{sec:bg} reviews the algorithmic and
-hardware primitives the five variants compose. Section~\ref{sec:related}
-positions our work against existing FlashAttention and FP4-attention
-literature. Section~\ref{sec:method} describes each variant's design
-rationale and the lessons forced by sm\_120a-specific tooling.
-Section~\ref{sec:exp} fixes our experimental protocol.
-Section~\ref{sec:results} presents the Pareto frontier and headline
-numbers. Sections~\ref{sec:disc} and~\ref{sec:limits} discuss
-implications and limitations. Appendix~\ref{app:repro} is the
-reproducibility checklist.
+\subsection*{Roadmap}
+Section~\ref{sec:bg} establishes necessary background.
+Section~\ref{sec:related} positions our work against eight prior
+contributions individually, with a comparison table.
+Sections~\ref{sec:method}--\ref{sec:exp} describe the kernels and
+methodology. Section~\ref{sec:results} presents results.
+Sections~\ref{sec:disc}--\ref{sec:limits} discuss implications and
+limitations, including a hardware-transfer table relating each of our
+findings to its closest prior result.
+Appendix~\ref{app:repro} is the reproducibility checklist.
 
 % =============================================================================
 \section{Background}
 \label{sec:bg}
 
-\paragraph*{Scaled dot-product attention} For queries $Q \in
-\mathbb{R}^{N \times D}$, keys $K \in \mathbb{R}^{N \times D}$, and
-values $V \in \mathbb{R}^{N \times D}$, the standard formulation is
+\paragraph*{Attention and its memory problem}
+Standard scaled dot-product attention computes
 \begin{equation}
-\mathrm{Attention}(Q,K,V) = \mathrm{softmax}\!\left(\tfrac{1}{\sqrt{D}}\, Q K^\top\right) V,
+\mathrm{Attn}(Q,K,V) = \mathrm{softmax}\!\left(\tfrac{1}{\sqrt{D}}\, Q K^\top\right) V,
 \label{eq:attn}
 \end{equation}
-where the softmax is row-wise over the score matrix $S = QK^\top \in
-\mathbb{R}^{N \times N}$~\cite{vaswani2017attention}. Materializing $S$
-costs $O(N^2)$ in HBM, which is the central problem the FlashAttention
-family attacks.
+where $Q$, $K$, $V$ are $N \times D$ matrices of queries, keys, and
+values, and the softmax is row-wise over the $N \times N$ score matrix
+$S = QK^\top$~\cite{vaswani2017attention}. Materializing $S$ in
+high-bandwidth memory (HBM) costs $O(N^2)$, which becomes the dominant
+memory-traffic and latency bottleneck at long context.
 
-\paragraph*{IO-aware tiling and online softmax} FlashAttention
-\cite{dao2022flashattention} streams over $K$ and $V$ in tiles, computes
-partial scores and partial probabilities tile-by-tile, and maintains a
-\emph{running} per-row maximum $m$ and partition sum $\ell$ via the
-recurrence
-\begin{align}
-  m^{(t)}      &= \max(m^{(t-1)},\, \max_j S_{:, j}^{(t)}), \\
-  \alpha^{(t)} &= \exp(m^{(t-1)} - m^{(t)}), \\
-  \ell^{(t)}   &= \alpha^{(t)} \ell^{(t-1)} + \textstyle\sum_j \exp(S_{:, j}^{(t)} - m^{(t)}), \\
-  O^{(t)}      &= \alpha^{(t)} O^{(t-1)} + \tilde P^{(t)} V^{(t)},
-\end{align}
-where $\tilde P^{(t)}_{ij} = \exp(S^{(t)}_{ij} - m^{(t)})$ is the
-unnormalized tile probability and $O$ the unnormalized output. A single
-epilogue divides by $\ell^{(N/B_C)}$ to recover the canonical attention.
-The recurrence is numerically stable, exact, and avoids storing $S$ or
-$P$ in HBM. We adopt this kernel structure in V2--V4.
+\paragraph*{Online softmax}
+FlashAttention~\cite{dao2022flashattention} eliminates the $S$
+materialization by streaming over $K$ and $V$ in tiles and computing
+partial softmax results tile-by-tile. The key trick is the
+\emph{online softmax} recurrence: as each new tile arrives, the kernel
+maintains a running per-row maximum and a running denominator, and
+rescales the partial output to account for the new maximum. The
+mathematical detail is in the original paper. For our purposes, two
+properties matter: the recurrence is exact (it produces the same
+numerical answer as the materialized version, up to floating-point
+roundoff), and it has two boundary cases not stated in the
+FlashAttention algorithm box but required for correctness---the first
+iteration (running max is $-\infty$) and the fully-masked case
+(causal padding past the diagonal), both of which can produce NaN if
+not guarded explicitly. Our V2 kernel handles both. We adopt the
+online-softmax structure in V2 through V4.
 
-Two corner cases of the recurrence are not stated in the FlashAttention
-algorithm box but are required for correctness: the \emph{first
-iteration}, where $m^{(0)} = -\infty$ and $\ell^{(0)} = 0$, and the
-\emph{fully-masked} case (causal masking past the diagonal, padded rows)
-where $m^{(t)}$ remains $-\infty$ and the naive $\alpha^{(t)} =
-\exp(m^{(t-1)} - m^{(t)})$ produces NaN. Our V2 kernel guards both:
-$\alpha^{(t)} = 1$ when $m^{(t)} = -\infty$, and $\tilde P$ is zeroed on
-masked elements before the row-sum.
+\paragraph*{Tensor Cores on consumer Blackwell}
+5\textsuperscript{th}-generation Tensor Cores expose a family of
+synchronous matrix-multiply-accumulate (\texttt{mma.sync})
+instructions that consume operands of various widths and produce a
+higher-precision accumulator. Three matter for this paper: the FP16
+mma at width $16{\times}8{\times}16$ (V1, V2, via the high-level
+\texttt{wmma} API); the FP8 (E4M3) mma at width $16{\times}8{\times}32$
+(V3, via inline PTX); and the FP4 (E2M1) mma at width
+$16{\times}8{\times}32$ (V4). The FP4 instruction requires the
+architecture-accelerated \texttt{sm\_120a} target;
+\texttt{ptxas} rejects it on the unsuffixed \texttt{sm\_120}, a
+detail that ships with the V4 source tree but is otherwise easy to
+miss. Each instruction places its operands in a per-thread register
+fragment whose layout is fully specified in the PTX
+ISA~\cite{nvidia2024ptxisa}. For the FP16 mma the layout is
+implementation-defined, which has consequences for V2 we discuss in
+Section~\ref{sec:method}.
 
-\paragraph*{Mixed-precision Tensor Cores on Blackwell} 5\textsuperscript{th}-
-generation Tensor Cores expose the synchronous matrix-multiply-accumulate
-\texttt{mma.sync} family. On consumer Blackwell (sm\_120a) the
-instructions relevant to attention are:
-\begin{itemize}
-  \item \texttt{m16n8k16.row.col.f32.f16.f16.f32}: the FP16 tensor-core
-        mma engaged by V1 and V2 via \texttt{nvcuda::wmma}~\cite{nvidia2024ptxisa}.
-        SASS mnemonic \texttt{HMMA.16816.F32}.
-  \item \texttt{m16n8k32.row.col.f32.e4m3.e4m3.f32}: FP8 (E4M3) sync
-        mma; used by V3 via inline PTX. SASS mnemonic on sm\_120 is
-        \texttt{QMMA.16832.F32.E4M3.E4M3}.
-  \item \texttt{kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32}: FP4
-        (E2M1) sync mma; used by V4. The \texttt{kind::f8f6f4} feature
-        requires the architecture-accelerated \texttt{sm\_120a} target;
-        ptxas rejects it on plain \texttt{sm\_120}. SASS mnemonic
-        \texttt{QMMA.16832.F32.E2M1.E2M1}.
-\end{itemize}
-Per-thread fragment layouts for these mmas are documented in PTX ISA
-\S9.7.13.5~\cite{nvidia2024ptxisa} and follow a consistent pattern: with
-$g = \mathrm{laneID} \gg 2$ and $t = \mathrm{laneID} \,\&\, 3$, the A
-fragment holds row pairs $(g, g+8)$ at 4-element column groups indexed
-by $t$. This idiom maps directly to row-major shared-memory tiles via
-\texttt{reinterpret\_cast<uint32\_t*>} accesses with no
-\texttt{ldmatrix} required.
+A fourth instruction family, \texttt{mxf4nvf4.m16n8k64}, internalizes
+a per-16-element scale factor at the hardware level and would in
+principle deliver a faster FP4 attention than V4. CUTLASS exposes it
+via \texttt{cute::SM120\_16x8x64\_TN}~\cite{nvidia2024cutlass}, but
+its operand layout uses scattered per-thread fragments that are
+incompatible with the row-major shared-memory idiom V1--V3 use.
+Engaging it would require a different shared-memory layout
+(\texttt{ldmatrix}-style swizzled access) and a CUTLASS-mediated
+load, which is multi-week scope; we treat it as future work.
 
-\paragraph*{Hardware microscaling and \texttt{mxf4nvf4}} An additional
-NVFP4 instruction family, \texttt{mxf4nvf4.m16n8k64}, internalizes a
-per-16-element scale factor at the hardware level. CUTLASS exposes the
-family via \texttt{cute::SM120\_16x8x64\_TN}~\cite{nvidia2024cutlass},
-but its A and B layouts use \emph{scattered} per-thread fragments
-incompatible with the consecutive-byte row-major SMEM access pattern
-V1--V3 use; engaging the family requires \texttt{ldmatrix}-style
-swizzled SMEM and a CUTLASS \texttt{CollectiveBuilder}-mediated load.
-We discuss the consequences in Section~\ref{sec:disc} and treat the
-\texttt{mxf4nvf4} path as deferred work.
+\paragraph*{What FP8 and FP4 can represent}
+FP8 (E4M3) provides roughly 16 representable positive values with a
+maximum magnitude of 448; FP4 (E2M1) provides roughly 6 representable
+positive values with a maximum of 6. Per-tile or per-block scaling is
+therefore not optional for either format: an unscaled tile of
+attention probabilities, which lie in $[0,1]$ but with contrast that
+varies dramatically across realistic workloads, would lose most of
+its small-magnitude entries to underflow. V3 uses a single scale per
+tile of $P$. V4 uses one scale per row per 32-element block of K---
+finer granularity, more faithful to FP4's narrower range. The
+empirical accuracy envelope of each is in Section~\ref{sec:results}.
 
-\paragraph*{FP8 and FP4 numeric envelopes} E4M3 (4 exponent bits, 3
-mantissa bits) provides $\approx 16$ representable positive values and
-maximum representable magnitude 448; E2M1 (2 exponent, 1 mantissa)
-provides $\approx 6$ positive values and max magnitude 6. Per-tile or
-per-block scaling is therefore not optional: an unscaled tile of
-attention probabilities, which lie in $[0,1]$ but with row-wise contrast
-that varies dramatically across realistic workloads, would lose the mass
-of small-magnitude entries to FP4 underflow. We quantify the contrast-
-dependent error envelope for V3 and V4 in Section~\ref{sec:results}.
-
-\paragraph*{PyTorch SDPA dispatch}
-\texttt{torch.nn.functional.scaled\_dot\_product\_attention} on
-PyTorch~2.9 dispatches to one of four backends:
-\texttt{FLASH\_ATTENTION}, \texttt{CUDNN\_ATTENTION},
-\texttt{EFFICIENT\_ATTENTION}, or
-\texttt{MATH}~\cite{pytorch2024sdpa}. Backend availability is determined
-at process start by a combination of build flags and runtime capability
-checks. A pinned-backend context manager is exposed via
-\texttt{torch.nn.attention.sdpa\_kernel(SDPBackend.NAME)}; we use it in
-our experimental protocol to attribute SDPA performance to a specific
-dispatch (Section~\ref{sec:exp}).
+\paragraph*{PyTorch SDPA dispatch is not a fixed reference}
+\texttt{torch.nn.functional.scaled\_dot\_product\_attention} (SDPA)
+is the standard PyTorch API for attention. At runtime it dispatches
+to one of four backends based on a combination of build flags and
+runtime capability checks: \texttt{FLASH\_ATTENTION},
+\texttt{CUDNN\_ATTENTION}, \texttt{EFFICIENT\_ATTENTION}, or
+\texttt{MATH}~\cite{pytorch2024sdpa}. The choice depends on the
+PyTorch wheel, the CUDA version, the GPU compute capability, the
+input dtype, the head dimension, the mask, and other factors. The
+pinning context manager
+\texttt{torch.nn.attention.sdpa\_kernel(SDPBackend.NAME)} forces a
+specific backend or fails if it is unavailable. We use it in our
+experiments to avoid a confound that has bitten the SageAttention3
+results~\cite{zhang2025sageattention3} as well as ours: which
+\emph{specific} backend SDPA picks materially changes ``the'' SDPA
+performance, and a paper that does not pin and disclose the dispatch
+is not measuring what it thinks it is.
 
 % =============================================================================
-\section{Related Work}
+\section{Related Work and Comparison to Prior Art}
 \label{sec:related}
 
-\paragraph*{Attention kernel optimization} The original FlashAttention
-\cite{dao2022flashattention} introduced IO-aware tile streaming and
-online softmax; FlashAttention-2~\cite{dao2024flashattention2} refined
-work partitioning across warps; FlashAttention-3
-\cite{shah2024flashattention3} added Hopper-specific warp-specialized
-pipelining and producer-consumer asynchrony, plus FP8 support. The H3
-design relies on the Tensor Memory Accelerator (TMA), which is absent on
-consumer Blackwell~\cite{nvidia2025blackwell}; portions of the Hopper-
-specific optimization therefore do not transfer to sm\_120a.
-\emph{vAttention}~\cite{prabhu2024vattention} is an alternative
-serving-system memory manager that documents PagedAttention's decode-
-time regressions versus the FlashAttention-2 baseline---useful context
-for the SDPA-dispatch story we develop in
-Section~\ref{sec:exp}---and FlexAttention~\cite{dong2025flexattention}
-is a programming model that compiles user-defined attention masks down
-to fused kernels via \texttt{torch.compile}. Our work targets the
-kernel itself, not the serving system or the compiler stack. The
-official Triton fused-attention tutorial~\cite{tritonlang2025attention}
-gates its Blackwell branch on a \texttt{major == 10} runtime check that
-does not yet first-class consumer sm\_120a, illustrating the
-ecosystem-maturity gap our paper measures.
+We position our work against eight specific prior contributions, then
+summarize the comparison in Table~\ref{tab:prior_work}. The aim is to
+make explicit, for each related paper, what they did, what we do, and
+where the difference lies. We organize the discussion by category:
+attention kernel optimization, mixed-precision attention (positive
+findings), mixed-precision attention (failure modes), consumer
+Blackwell ecosystem maturity, and reproducibility methodology.
 
-\paragraph*{Mixed-precision attention} Micikevicius et
-al.~\cite{micikevicius2022fp8} introduced the E4M3 and E5M2 FP8 formats
-the FP8 mma instructions consume. SageAttention~\cite{zhang2025sageattention}
-established FP8 attention as a practical inference primitive on Hopper,
-outperforming FlashAttention-2 by $\approx 2.1\times$.
-SageAttention3~\cite{zhang2025sageattention3} is the closest related
-work to ours: it demonstrates an FP4 attention kernel on the RTX~5090
-(Blackwell consumer flagship, sm\_120a) that engages the hardware-
-microscaled \texttt{mxf4nvf4} mma family with an NVFP4-standard
-16-element block. Our V4 \emph{differs in three respects}:
-(i)~target hardware---we characterize the RTX~5080, an SKU with 19\%
-fewer SMs and a 384-bit versus 512-bit memory interface than the 5090;
-(ii)~instruction choice---we use the software-microscaled
-\texttt{kind::f8f6f4.m16n8k32} path with a 32-element block, because
-the hardware-microscaled mma's scattered-fragment layout is incompatible
-with the row-major-SMEM idiom shared with V3 (Section~\ref{sec:method});
-and (iii)~framing---we present V4 as part of a \emph{controlled ablation
-study} including FP32, FP16-tiled, FP16-fused, and FP8-fused points,
-rather than a standalone FP4 kernel. The negative result we
-report---V4 slower than V3 by $\approx 30\%$---is consistent with
-SageAttention3's own observation that hardware microscaling matters; we
-make the cost concrete in the absence of that hardware path. We do not
-aim to outperform SageAttention3; we cite their FP4 throughput as the
-upper bound the hardware-microscaled path would deliver.
-SnapMLA~\cite{zhang2026snapmla} extends FP8 attention to long-context
-MLA decoding with per-component precision retention; the present paper
-operates on standard MHA, but the SnapMLA result is a useful indication
-that the per-tile vs.\ per-component precision-allocation lever
-generalizes beyond MHA.
+\subsection{Attention Kernel Optimization}
 
-Recent work has also examined low-precision \emph{training} stability.
-Qiu and Yao~\cite{qiu2025lowprecisionfails} attribute catastrophic
-loss explosion in low-precision flash attention training to the joint
-effect of low-rank representation collapse and compounding biased
-rounding errors. \emph{Attn-QAT}~\cite{zhang2026attnqat} provides the
-first systematic study of 4-bit QAT for attention, showing that the
-natural ``FP4 forward + high-precision Flash backward'' recipe is
-unstable and identifying matched-precision recomputation as the
-necessary stability principle. We focus exclusively on
-\emph{forward-pass inference}; both training-stability sources
-nevertheless help characterize what FP4 attention can absorb
-numerically, and our error envelope (Section~\ref{sec:results}) is
-consistent with the inference-side picture they imply.
+\paragraph*{FlashAttention~\cite{dao2022flashattention}}
+\emph{What they did:} introduced IO-aware tile streaming with online
+softmax, eliminating the $N{\times}N$ score-matrix materialization;
+A100 / FP16. \emph{What we do:} our V2 is a faithful FP16
+re-implementation of this algorithmic skeleton on consumer Blackwell,
+serving as the platform-on-which-fusion-was-tested baseline rather
+than a competitor. \emph{Difference:} we replicate the algorithmic
+contribution on a hardware tier the original work did not target, and
+we do so as one rung of a controlled ladder rather than a standalone
+optimized kernel.
 
-\paragraph*{KV-cache quantization (orthogonal axis)} A separate line of
-work pushes the KV cache to 4-, 3-, and 2-bit
-representations~\cite{liu2024kivi,hooper2024kvquant} for long-context
-inference. KV quantization is orthogonal to our axis: it changes the
-\emph{stored} representation between attention layers, while we change
-the \emph{computed} representation inside a single attention call.
-Combining the two on consumer Blackwell is a clear future-work
-direction.
+\paragraph*{FlashAttention-3~\cite{shah2024flashattention3}}
+\emph{What they did:} added Hopper-specific warp-specialized
+pipelining via the Tensor Memory Accelerator (TMA) and introduced
+FP8 (E4M3) throughput; H100. \emph{What we do:} our V3 borrows the
+register-resident accumulator idea but implements it via hand-rolled
+inline PTX. \emph{Difference:} TMA is absent on consumer
+Blackwell~\cite{nvidia2025blackwell}, so the warp-specialized
+pipelining does not transfer. The CUTLASS reference example for
+Blackwell FMHA (\texttt{77\_blackwell\_fmha}) is gated to
+sm\_100a/sm\_103a as of v4.4.2~\cite{nvidia2024cutlass}, leaving the
+inline-PTX path as the only realistic implementation route on
+sm\_120a. Our finding is consistent with FA-3's FP8-vs-FP16 latency
+ratio in spirit, but the absolute numbers are tier-specific.
 
-\paragraph*{Reproducibility and hardware-transfer studies} Pineau et
-al.~\cite{pineau2021reproducibility} document reproducibility failures
-in machine learning research; Desai et al.~\cite{desai2025reproducibility}
-provide a taxonomy specific to AI/ML systems work. Kalibera and
-Jones~\cite{kalibera2013rigorous} and van der Kouwe et
-al.~\cite{vanderkouwe2018benchmarkingcrimes} catalogue methodological
-errors common in systems benchmarking---insufficient warmup, single-run
-timings, undisclosed clock states---which we explicitly defend against
-(Section~\ref{sec:exp}). Our paper sits in this lineage: a single-GPU,
-single-precision-family transferability study on a hardware tier
-underrepresented in the published record.
+\paragraph*{FlexAttention~\cite{dong2025flexattention}}
+\emph{What they did:} compiler-driven programming model that compiles
+user-defined attention masks via \texttt{torch.compile}, achieving
+within $\sim$30\% of hand-tuned kernels with much less code; PyTorch.
+\emph{What we do:} we hand-roll kernels in CUDA and inline PTX.
+\emph{Difference:} different optimization targets. FlexAttention
+trades raw performance for programmability, ours trades
+programmability for hardware-specific performance and a controlled
+ablation. The two are complementary; FlexAttention is an
+\emph{alternative} a deployer would consider, not a competitor on
+the Pareto curve.
+
+\paragraph*{vLLM PagedAttention~\cite{kwon2023vllm} and
+vAttention~\cite{prabhu2024vattention}}
+\emph{What they did:} serving-system primitives for KV-cache memory
+management, with vAttention specifically documenting PagedAttention
+decode-time regressions versus FlashAttention-2.
+\emph{What we do:} we target the kernel itself, not the serving
+system. \emph{Difference:} kernel-level vs system-level. Our V3 could
+be plugged into either system; the comparison is orthogonal. We cite
+these to mark them as the practical alternatives a deployed
+inference stack would consider, not to compete with them.
+
+\subsection{Mixed-Precision Attention: Positive Findings}
+
+\paragraph*{Micikevicius et al.~\cite{micikevicius2022fp8}}
+\emph{What they did:} formalized E4M3 / E5M2 FP8 formats and
+delayed-scaling recipe for mixed-precision training; H100.
+\emph{What we do:} adopt the forward-pass E4M3 recipe in V3.
+\emph{Difference:} we apply it to inference attention specifically,
+not training; we use per-tile static scaling rather than delayed
+scaling because forward-only inference does not require optimizer-
+state preservation; we add the V3-vs-V4 comparison that they could
+not (FP4 hardware did not exist).
+
+\paragraph*{SageAttention~\cite{zhang2025sageattention} (the original 8-bit work)}
+\emph{What they did:} demonstrated that 8-bit attention is
+plug-and-play deployable; outperforms FlashAttention-2 by $\sim
+2.1\times$ and xformers by $\sim 2.7\times$ on Hopper; ICLR 2025.
+\emph{What we do:} V3 demonstrates the same trajectory on consumer
+Blackwell. \emph{Difference:} hardware tier (Hopper vs sm\_120a),
+SDPA-baseline backend (FlashAttention-2 vs MATH-backend cuBLAS), and
+framing (standalone optimized kernel vs ladder ablation). Our V3's
+$2.4\times$ over V2 is consistent with their $\sim 2.1\times$ over
+FlashAttention-2 in spirit, but the absolute numbers are not
+directly comparable because the baselines differ.
+
+\paragraph*{SageAttention3~\cite{zhang2025sageattention3}}
+This is our closest related work. We treat it in detail.
+
+\emph{What they did:} demonstrated NVFP4 attention on RTX~5090
+(Blackwell consumer flagship, sm\_120a) using the
+hardware-microscaled \texttt{mxf4nvf4.m16n8k64} mma family with the
+NVFP4-standard 16-element block; reported throughput exceeding
+FlashAttention-3's FP8; NeurIPS 2025 Spotlight.
+
+\emph{What we do:} V4 attempts the FP4 attention transfer to
+RTX~5080 using the software-microscaled
+\texttt{kind::f8f6f4.m16n8k32} path with a 32-element block, and
+reports a negative result---V4 is $\approx 30\%$ slower than V3 (FP8)
+on this hardware/software combination.
+
+\emph{Difference, in three concrete dimensions:}
+\begin{itemize}
+  \item \emph{Target SKU.} RTX~5090 has 170 SMs, 32~GB GDDR7, and a
+        512-bit memory interface. RTX~5080 has 84 SMs, 16~GB GDDR7,
+        and a 256-bit interface. Both are sm\_120a, but the per-SM
+        cache topology, register pressure budget, and HBM bandwidth
+        differ enough that ``it works on 5090'' does not imply
+        ``it works on 5080.''
+  \item \emph{Instruction family.} SageAttention3 uses
+        \texttt{mxf4nvf4.m16n8k64}, which internalizes per-16-element
+        scaling at the mma boundary. We use
+        \texttt{kind::f8f6f4.m16n8k32}, which requires software
+        microscaling. The two paths are not interchangeable: the
+        hardware path's scattered per-thread fragments are
+        incompatible with the row-major SMEM idiom we share with V3.
+        Engaging the hardware path would require a different SMEM
+        layout (\texttt{ldmatrix}-style swizzled access) we estimate
+        at multi-week scope.
+  \item \emph{Framing.} SageAttention3 is a standalone optimized
+        kernel; per-step contributions of fusion, FP8, and FP4 are
+        not separable from their results because they only present
+        the final FP4 number. Our ladder presents V0/V1/V2/V3/V4
+        side by side, so the contribution of \emph{each} step on
+        the same hardware is measurable. The negative V4 result
+        therefore says something specific---``software microscaling
+        overhead exceeds FP4 throughput advantage''---rather than
+        ``FP4 does not work,'' which would be inconsistent with
+        SageAttention3's positive result on hardware microscaling.
+\end{itemize}
+
+We do not aim to outperform SageAttention3; we cite their FP4
+throughput as the upper bound the hardware-microscaled path would
+deliver on a related platform.
+
+\subsection{Mixed-Precision Attention: Failure Modes}
+
+The following three works share with us the position that
+low-precision attention is not always Pareto-dominant. We
+contextualize each.
+
+\paragraph*{Attn-QAT~\cite{zhang2026attnqat}}
+\emph{What they did:} first systematic study of 4-bit
+quantization-aware training for attention; identified that the
+natural FP4 forward + high-precision FlashAttention backward recipe
+is unstable and proposed two principles for stability (matching
+low-precision recomputation and resolving FA's implicit precision
+assumptions); RTX~5090, 1.5x diffusion-model speedup; preprint 2026.
+\emph{What we do:} forward-pass inference only, no QAT; V4 reports
+the per-mma cost of forward FP4 attention with software
+microscaling. \emph{Difference:} our scope is forward inference;
+theirs is training. The two are complementary failure-mode
+characterizations: theirs explains why naive FP4 training diverges,
+ours quantifies why naive FP4 inference does not always win on
+consumer hardware. The bulk-correctness envelope we measure
+(rel-L2 of $\approx 0.21$ at unit variance for V4) sits below the
+threshold where Attn-QAT-style intervention would be necessary, but
+our negative latency result says inference-time FP4 deployment
+faces an additional hurdle they do not address.
+
+\paragraph*{Qiu and Yao~\cite{qiu2025lowprecisionfails} (``Why Low-Precision Fails'')}
+\emph{What they did:} mechanistic explanation of catastrophic loss
+explosion in low-precision FlashAttention training; identifies the
+joint effect of (a) emergence of similar low-rank representations
+within attention and (b) compounding biased rounding errors in the
+online softmax recurrence; proposes a minimal modification to flash
+attention that mitigates the rounding bias; ICLR 2026 poster.
+\emph{What we do:} we measure the inference-time consequence of the
+same online-softmax-recurrence rounding pattern: V3's
+contrast-dependent error envelope (Section~\ref{sec:results}) shows
+a roughly linear growth in relative error with input variance,
+consistent with the bias-accumulation mechanism Qiu and Yao
+identify. \emph{Difference:} they target training stability and
+weight updates; we target inference accuracy and a stable
+deployment recommendation. Their proposed modification could in
+principle reduce V3's contrast-dependent floor, but we have not
+tested it; this is one of several orthogonal extensions a future
+artifact could integrate.
+
+\paragraph*{SnapMLA~\cite{zhang2026snapmla}}
+\emph{What they did:} characterized FP8 attention sub-types (RoPE-
+bearing components, MLA decode, KV-shared structure) requiring
+per-component precision retention; co-designs algorithm and kernel
+for DeepSeek MLA decoding; up to $1.91\times$ throughput; preprint
+2026. \emph{What we do:} per-tile (V3) and per-row, per-K-block
+(V4) uniform scaling without component-aware retention.
+\emph{Difference:} different masking and architecture target
+(MLA decode in their case, dense non-causal forward in ours).
+Their finding---that not all attention sub-tensors should be
+quantized at the same granularity---argues that V3's contrast-
+dependent error floor could be reduced by component-aware scaling,
+but at the cost of additional kernel complexity. We do not pursue
+this in V3 and document it as a defensible follow-up.
+
+\subsection{Consumer Blackwell Ecosystem Maturity}
+
+\paragraph*{vLLM RTX~5080/5090 setup~\cite{vllm2025issue14452} and CUDA~13 regression~\cite{vllm2025issue29030}}
+\emph{What they did:} document concrete RTX 5080/5090 deployment
+hurdles---CUDA 12.8 + container required, FA-3 backend not
+working with Blackwell, undefined symbols in vLLM 0.11.1 under
+CUDA~13.0 (\texttt{cutlass\_moe\_mm\_sm100} not a superset of
+sm\_120). \emph{What we do:} document the V4 build's parallel
+hurdle---\texttt{kind::f8f6f4} requires \texttt{sm\_120a}, not
+\texttt{sm\_120}, and the runtime SDPA attempts to pin
+\texttt{FLASH\_ATTENTION} are rejected at runtime.
+\emph{Difference:} they target inference-server deployment; we
+target kernel development. Both are evidence that the consumer-
+Blackwell software stack is genuinely immature and that papers
+in this space need to disclose the exact build under test.
+
+\paragraph*{vLLM FlashInfer FP8 accuracy regression~\cite{vllm2026issue35138}}
+\emph{What they did:} document a Blackwell-specific FP8 attention
+correctness divergence in FlashInfer; recommend backend switch to
+Flash-Attn rather than precision change. \emph{What we do:}
+report that the SDPA FP16 path on this PyTorch build also has
+non-obvious dispatch (falls through to MATH backend).
+\emph{Difference:} their finding is a specific bug; ours is a
+build-time configuration finding. Both reinforce the
+methodological argument that the ``vendor baseline'' is a moving
+target on consumer Blackwell.
+
+\paragraph*{vLLM RTX 5080 NVFP4 pre-flight memory rejection~\cite{vllm2025issue30707}}
+\emph{What they did:} document a 14~GB NVFP4 model + 2~GB KV cache
+that fits in 16~GB but is rejected by overly aggressive
+pre-flight validation. \emph{What we do:} report V4 actually
+running on the same 16~GB card with NVFP4 weights, demonstrating
+that the validation rejection is not a fundamental hardware
+constraint. \emph{Difference:} they document a deployment
+constraint; we demonstrate the underlying capability is present.
+This is corroborating evidence for our claim that consumer-
+Blackwell software is the binding constraint, not the hardware.
+
+\subsection{Reproducibility and Hardware-Transfer Methodology}
+
+\paragraph*{Pineau et al.~\cite{pineau2021reproducibility} and Desai et al.~\cite{desai2025reproducibility}}
+\emph{What they did:} establish the reproducibility taxonomy and
+checklist for ML research (Pineau, NeurIPS 2019 program report);
+formalize repeatability vs.\ dependent / independent reproducibility
+vs.\ direct / conceptual replication (Desai). \emph{What we do:}
+position our work as a \emph{conceptual replication under hardware
+shift} (Desai's terminology), and follow the Pineau checklist for
+artifact release. \emph{Difference:} not a methodological
+contribution---we are an instance of the framework. We cite to make
+the positioning explicit.
+
+\paragraph*{Kalibera and Jones~\cite{kalibera2013rigorous} and van der Kouwe et al.~\cite{vanderkouwe2018benchmarkingcrimes}}
+\emph{What they did:} steady-state benchmark methodology and
+catalog of benchmarking errors. \emph{What we do:} use 100 warmup
++ 500 timed iterations, paired CUDA events, p50/p95/p99 reporting,
+disclosed clock state, paired-backend SDPA comparison (where
+possible). \emph{Difference:} we apply their methodology to a
+GPU-kernel context they did not explicitly target (their examples
+are JVMs and security defenses). The principles transfer; the
+specific defenses (paired CUDA events vs.\ wall-clock,
+\texttt{cuobjdump}-based instruction inspection vs.\ admin-gated
+profiler) are GPU-specific.
+
+\paragraph*{Adjacent consumer Blackwell work~\cite{shao2026slidesparse,knoop2026consumerllm}}
+\emph{What they did:} SlideSparse evaluates on a wide consumer +
+datacenter GPU portfolio including the RTX~5080, but for sparse
+GEMM, not attention. Knoop and Holtmann benchmark RTX 5060 Ti,
+5070 Ti, and 5090 for inference but explicitly omit the 5080.
+\emph{What we do:} kernel-level attention on the RTX~5080
+specifically. \emph{Difference:} workload (sparse GEMM /
+inference-server vs attention kernel) and SKU coverage (5080
+included, vs 5080 omitted). The combination---kernel-level
+attention on the RTX~5080---is, to our knowledge, original to
+this paper.
+
+\subsection{Comparison Summary}
+
+Table~\ref{tab:prior_work} consolidates the above. Each row marks,
+for one prior work, the dimension on which we differ.
+
+\begin{table*}[t]
+  \centering
+  \caption{Comparison to Prior Work. Each row marks where our paper
+    differs from one prior contribution. ``$\bullet$'' = same;
+    ``$\circ$'' = different.}
+  \label{tab:prior_work}
+  \footnotesize
+  \begin{tabular}{lccccccc}
+    \toprule
+    \textbf{Prior work} & \textbf{Same algo} & \textbf{Same precision} &
+    \textbf{Same SKU} & \textbf{Same instr.\ family} &
+    \textbf{Same scope} & \textbf{Same baseline} & \textbf{Our delta} \\
+    \midrule
+    FlashAttention~\cite{dao2022flashattention}        & $\bullet$ & $\bullet$ (FP16) & $\circ$ (A100) & $\circ$ (legacy mma) & $\bullet$ infer. & $\circ$ & RTX~5080 replication \\
+    FlashAttention-3~\cite{shah2024flashattention3}    & $\bullet$ & $\bullet$ (FP8) & $\circ$ (H100)  & $\circ$ (TMA path)   & $\bullet$ infer. & $\circ$ & no-TMA tier, hand PTX \\
+    FlexAttention~\cite{dong2025flexattention}         & $\circ$   & $\circ$ (FP16)   & $\circ$         & $\circ$ (compiler)   & $\bullet$ infer. & $\bullet$ & raw kernel vs compile \\
+    PagedAttention~\cite{kwon2023vllm}                 & $\bullet$ & $\bullet$       & $\circ$         & $\bullet$            & $\circ$ serving  & $\circ$ & kernel level only \\
+    Micikevicius FP8~\cite{micikevicius2022fp8}        & $\circ$   & $\bullet$ (E4M3) & $\circ$ (H100) & $\bullet$ FP8 mma    & $\circ$ training & $\circ$ & inference, per-tile \\
+    SageAttention~\cite{zhang2025sageattention}        & $\bullet$ & $\bullet$ (FP8)  & $\circ$ (Hopper) & $\bullet$ FP8 mma  & $\bullet$ infer. & $\circ$ FA-2 & MATH-backend SDPA \\
+    SageAttention3~\cite{zhang2025sageattention3}      & $\bullet$ & $\bullet$ (FP4)  & $\circ$ (5090)   & $\circ$ HW microsc. & $\bullet$ infer. & $\circ$ & 5080, SW microsc., ladder \\
+    Attn-QAT~\cite{zhang2026attnqat}                   & $\bullet$ & $\bullet$ (FP4)  & $\circ$ (5090)   & $\circ$ HW microsc. & $\circ$ training & $\circ$ & forward only, no QAT \\
+    Qiu \& Yao~\cite{qiu2025lowprecisionfails}         & $\bullet$ & $\bullet$ (BF16) & $\circ$         & $\circ$              & $\circ$ training & $\circ$ & inference manifestation \\
+    SnapMLA~\cite{zhang2026snapmla}                    & $\circ$ MLA & $\bullet$ (FP8) & $\circ$         & $\bullet$            & $\bullet$ infer. & $\circ$ & dense, no MLA \\
+    SlideSparse~\cite{shao2026slidesparse}             & $\circ$ GEMM & $\circ$        & $\bullet$ 5080  & $\circ$ sparse       & $\bullet$ infer. & $\circ$ & attention, not GEMM \\
+    Knoop \& Holtmann~\cite{knoop2026consumerllm}      & $\circ$ infer. & $\circ$ mixed & $\circ$ (no 5080) & $\circ$ system    & $\circ$ system  & $\circ$ & 5080, kernel level \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
 
 % =============================================================================
 \section{Methodology}
 \label{sec:method}
 
-We implement five attention-kernel variants, each isolating a single
+We implement five attention-kernel variants, each isolating one
 optimization or precision change against its predecessor. All kernels
-take FP16 inputs $(Q, K, V)$ in the same shape and produce an FP16
-output $O$, allowing identical correctness tests and a direct relative-
-L2 comparison against an FP32 reference at every stage. Common
-infrastructure---tile sizing macros, dynamic-shared-memory opt-in,
-correctness oracle, FLOP accounting---lives in \texttt{kernels/common/}.
+take FP16 inputs $(Q, K, V)$ and produce an FP16 output $O$, allowing
+identical correctness tests across the ladder via a relative-L2
+comparison against an FP32 reference. Common infrastructure---tile
+sizing macros, dynamic-shared-memory opt-in, correctness oracle, FLOP
+accounting---lives in \texttt{kernels/common/}.
 
 \subsection{V0: FP32 Naive (Correctness Oracle)}
-\label{sec:method:v0}
 
-V0 materializes the full $N \times N$ attention matrix in HBM in three
-launches: a tiled $QK^\top$ matmul writing $S$ to global memory, a two-
-pass row-wise softmax (max-subtract, exp, normalize) writing $P$ to
-global memory, and a $PV$ matmul writing $O$. All three launches operate
-in FP32. V0 serves two purposes: (i) it is the \emph{correctness
-oracle} against which V1--V4 are compared via per-element absolute and
-relative tolerances, and (ii) it establishes the \emph{worst-case}
-memory and latency baseline.
+V0 materializes the full $N \times N$ attention matrix in HBM via
+three separate kernel launches: a tiled $QK^\top$ matmul, a row-wise
+softmax, and a $PV$ matmul. All three operate in FP32. V0 is
+intentionally not optimized; its job is to be obviously correct and
+to serve as the reference against which V1 through V4 are measured.
 
-V0 is intentionally not optimized. The block-reduction softmax requires
-a non-trivial \texttt{\_\_syncthreads()} between the two reduction phases
-when the row-max result is read into a register before the second
-buffer write; without it we observed nondeterministic $\sim 6\%$
-mismatch on sufficiently large $N$ in the early V0 session. V0 uses
-\texttt{--use\_fast\_math}; the impact on FP32 accuracy was below
-$10^{-6}$ across the test grid.
+One subtle point worth flagging: the row-wise softmax requires a
+\texttt{\_\_syncthreads()} between its two reduction phases (max-
+subtract and normalize). Without it we observed a nondeterministic
+$\sim 6\%$ output mismatch on sufficiently large $N$, which took
+several hours to diagnose. V0 uses \texttt{--use\_fast\_math};
+the impact on FP32 accuracy was below $10^{-6}$ across the test grid.
 
 \subsection{V1: FP16 Tiled, WMMA Tensor Cores}
-\label{sec:method:v1}
 
-V1 retains V0's three-launch structure but switches to FP16 inputs and
-uses Tensor Cores for both matmuls via the \texttt{nvcuda::wmma} API.
-The QK matmul is structured around a $16 \times 16 \times 16$
-\texttt{wmma} tile with $\mathrm{B}_R = \mathrm{B}_C = \mathrm{B}_D =
-64$. Two design choices are worth flagging.
+V1 keeps V0's three-launch structure but switches inputs to FP16 and
+uses Tensor Cores for both matmuls via the \texttt{nvcuda::wmma}
+API. Two design choices are worth flagging.
 
-\paragraph*{$Q K^\top$ without an explicit transpose pass} The B fragment
-in WMMA accepts a column-major matrix layout. Loading $K$ (row-major in
-HBM) as a column-major operand with leading dimension $D$ produces
-$K^\top$ implicitly: the column-major stride pattern indexes the same
-memory elements a row-major load of $K$ would, but transposed in
-operand-space. No data movement, no extra kernel.
+First, the $QK^\top$ matmul does not require an explicit transpose
+pass: the WMMA B fragment accepts a column-major operand, and loading
+$K$ (row-major in HBM) as column-major produces $K^\top$ implicitly.
+No data movement, no extra kernel.
 
-\paragraph*{Single dynamic shared-memory allocation} On Blackwell,
-static \texttt{\_\_shared\_\_} arrays and dynamic \texttt{extern
-\_\_shared\_\_} together count against a 48~KB default per-block cap.
-V1's per-tile budget at $D = 128$ is exactly 48~KB (32~KB FP16 tiles
-plus 16~KB FP32 scratch), with no headroom. We allocate a single
-dynamic SMEM region and \texttt{reinterpret\_cast} sub-regions out of it;
-this is a precondition for V2's larger tiles.
+Second, on Blackwell the static \texttt{\_\_shared\_\_} arrays and
+dynamic \texttt{extern \_\_shared\_\_} together count against a 48~KB
+default per-block cap. V1's per-tile budget at $D = 128$ is exactly
+48~KB, with no headroom. We allocate a single dynamic SMEM region
+and \texttt{reinterpret\_cast} sub-regions out of it; this is a
+precondition for V2's larger tile allocations.
 
-V1 still materializes $S$ (FP16) and $P$ (FP16) to HBM. The intermediate
-$S$ tensor is the dominant memory-bandwidth cost at long sequence
-lengths and is what fusion in V2 eliminates.
+V1 still materializes the score matrix $S$ and the probability
+matrix $P$ in HBM. The intermediate $S$ tensor is the dominant
+memory-bandwidth cost at long sequence lengths and is what V2's
+fusion eliminates.
 
 \subsection{V2: FP16 Fused (Online Softmax)}
-\label{sec:method:v2}
 
 V2 collapses the three V1 launches into a single fused kernel and
 applies the online softmax recurrence (Section~\ref{sec:bg}). Per
 $(\mathrm{batch}, \mathrm{head})$ pair we launch one block per
 $\mathrm{B}_R$-row tile of $O$; the block iterates internally over the
-$N / \mathrm{B}_C$ key/value tiles, maintaining $m$, $\ell$, and the
-unnormalized accumulator $O$ across iterations and dividing by $\ell$
-at the epilogue.
+$N / \mathrm{B}_C$ key/value tiles, maintaining the running max and
+denominator across iterations and dividing by the denominator at the
+epilogue.
 
-The per-block shared-memory layout at $D = 128$ totals 96~KB. The
-default cap is 48~KB; the launch silently fails without
-\texttt{cudaFuncSetAttribute(...,
-cudaFuncAttributeMaxDynamicSharedMemorySize, bytes)}. RTX~5080 sm\_120
-supports up to $\sim$99~KB per block; we cache the attribute call
-behind a \texttt{static bool} so it is paid once per process.
+The shared-memory layout at $D = 128$ totals 96~KB---over twice the
+default cap. The launch silently fails without
+\texttt{cudaFuncSetAttribute(\dots, MaxDynamicSharedMemorySize,
+bytes)}. The RTX~5080 sm\_120 supports up to $\sim$99~KB per block;
+we cache the attribute call behind a \texttt{static bool} so it is
+paid once per process.
 
-\paragraph*{Where V2 stops} The per-iteration update $O \leftarrow
-\alpha \cdot O + \tilde P V$ requires multiplying every element of $O$
-by a per-row scalar $\alpha$. WMMA accumulator fragments have
-implementation-defined per-thread layouts: scaling a fragment by a per-
-row scalar requires either knowing the layout or using a shfl-based
-broadcast that depends on it. V2 takes the layout-agnostic shortcut: it
-stores the accumulator to SMEM, applies the rescale, reloads it into a
-fragment for the next mma. The SMEM round trip is the dominant
-remaining latency cost in V2 and motivates the move to inline
-\texttt{mma.sync} in V3.
-
-We template the kernel by $\mathrm{HEAD\_DIM} \in \{64, 128\}$ so the
-inner-D fragment count $\mathrm{FRAG}_{BD} = \mathrm{HEAD\_DIM} /
-\mathrm{WMMA}_N$ is a compile-time constant.
+V2's main remaining performance limitation is structural rather than
+algorithmic. The online-softmax update requires multiplying every
+element of the running output accumulator by a per-row scalar at
+each iteration. WMMA accumulator fragments have implementation-
+defined per-thread layouts, so applying a per-row scalar to a
+fragment requires either knowing the layout or doing a
+layout-agnostic round trip through shared memory. V2 takes the
+layout-agnostic route: store the accumulator to SMEM, apply the
+rescale, reload it into a fragment for the next mma. This SMEM
+round trip is the dominant remaining latency cost in V2, and it is
+exactly what V3's hand-rolled \texttt{mma.sync} avoids. We template
+the kernel by $\mathrm{HEAD\_DIM} \in \{64, 128\}$ so the inner-D
+fragment count is a compile-time constant.
 
 \subsection{V3: FP8 Fused with Hand-Rolled \texttt{mma.sync}}
 \label{sec:method:v3}
 
-V3 swaps the FP16 mma for the FP8 (E4M3)
-\texttt{mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32} via inline
-PTX. The key change versus V2 is that the per-thread fragment layout
-for this mma is \emph{fully specified} in the PTX ISA; V3 keeps the
-output accumulator in registers across the K/V iteration loop,
-replacing V2's SMEM round trip with a per-iteration register-resident
-scaling.
+V3 swaps V2's FP16 \texttt{wmma} matmul for the FP8 (E4M3)
+\texttt{mma.sync} at width $16{\times}8{\times}32$, called via inline
+PTX. The key advantage is that the \texttt{mma.sync} per-thread
+fragment layout is \emph{fully specified} in the PTX ISA, not
+implementation-defined as in WMMA. V3 keeps the output accumulator
+in registers across the K/V iteration loop, replacing V2's SMEM
+round trip with a per-iteration register-resident scaling.
 
-\paragraph*{Why inline PTX rather than CUTLASS} The natural CUTLASS
-reference for this kernel is \texttt{77\_blackwell\_fmha}, but as of
-v4.4.2 it gates compilation to sm\_100a/sm\_103a (the datacenter
-Blackwell parts that have TMA). sm\_120a has no FMHA reference example,
-only GEMM examples~\cite{nvidia2024cutlass}. Composing a V3-equivalent
-FMHA from CUTLASS's \texttt{CollectiveBuilder} primitives on sm\_120a
-would require manually composing the warp-specialized persistent
-dispatch with a softmax-fused inner loop---multi-week scope out of
-proportion with V3's marginal complexity over V2. We use inline PTX
-following the
+\paragraph*{Why inline PTX rather than CUTLASS}
+The natural CUTLASS reference for this kernel is
+\texttt{77\_blackwell\_fmha}, but as of v4.4.2 it gates compilation
+to sm\_100a/sm\_103a (the datacenter Blackwell parts that have
+TMA). sm\_120a has no FMHA reference example, only GEMM
+examples~\cite{nvidia2024cutlass}. Composing a V3-equivalent fused
+multi-head attention from CUTLASS's \texttt{CollectiveBuilder}
+primitives on sm\_120a would require manually composing the
+warp-specialized persistent dispatch with a softmax-fused inner
+loop---multi-week scope, and out of proportion to V3's marginal
+complexity over V2. We use inline PTX following the
 \texttt{cute::SM89\_16x8x32\_F32E4M3E4M3F32\_TN} register-layout
 convention but do not link CUTLASS at build time.
 
-\paragraph*{Per-tile FP8 scaling} Each $Q$, $K$, $V$ tile is rescaled
-cooperatively by the block before the cooperative quantize-to-FP8 store:
-each thread holds its slice of the FP16 input in registers, contributes
-to a block-wide \texttt{absmax} reduction, the published scale is
-broadcast back, and the FP8 store proceeds register$\,\to\,$SMEM. There
-is no FP16 staging buffer, halving the per-tile SMEM. The probability
-matrix $P$ is rescaled \emph{per tile} by a single scale derived from
-the tile-wide max of $P$. This contrast-dependent FP8 scale is the
-dominant accuracy lever for V3 and sets the per-element error envelope
+\paragraph*{Per-tile FP8 scaling}
+Each $Q$, $K$, and $V$ tile is rescaled cooperatively before being
+quantized to FP8 and stored to SMEM. Each thread holds its slice of
+the FP16 input in registers, contributes to a block-wide
+\texttt{absmax} reduction, the published scale is broadcast back,
+and the FP8 store proceeds register-to-SMEM with no FP16 staging
+buffer. This halves the per-tile SMEM footprint relative to a
+stage-then-quantize design. The probability matrix $P$ is rescaled
+per-tile by a single scale derived from the tile-wide max of $P$.
+This contrast-dependent FP8 scale is the dominant accuracy lever
+for V3 and sets its empirical error envelope
 (Section~\ref{sec:results}).
 
-\paragraph*{$V$ stored col-major in SMEM} The TN form of
-\texttt{m16n8k32} requires the B operand col-major. We fold the
-transpose into the cooperative load: each thread reads
-$V_{\mathrm{global}}[r, c]$ row-major and writes
-$V_{\mathrm{smem}}^\top[c \cdot \mathrm{B}_C + r]$ col-major. Single
-pass, no extra kernel.
+\paragraph*{$V$ stored col-major in SMEM}
+The $16{\times}8{\times}32$ \texttt{mma.sync} requires the B operand
+in column-major layout. We fold the transpose into the cooperative
+load: each thread reads $V$ row-major from HBM and writes it
+column-major to SMEM. Single pass, no extra kernel.
 
 V3 emits 96 \texttt{QMMA.16832.F32.E4M3.E4M3} instructions in cubin
-across the two $\mathrm{HEAD\_DIM}$ template instantiations, verifiable
-via \texttt{cuobjdump --dump-sass | Select-String QMMA}---a
-substantively better-grounded Tensor-Core engagement check than Nsight
-Compute's sampled metric, which on consumer Blackwell is gated behind
-\texttt{ERR\_NVGPUCTRPERM} admin requirements.
+across the two HEAD\_DIM template instantiations, verifiable via
+\texttt{cuobjdump --dump-sass | Select-String QMMA}. We use this
+post-build check rather than Nsight Compute's runtime
+Tensor-Core-engagement metric, which on consumer Blackwell is gated
+behind admin-only \texttt{ERR\_NVGPUCTRPERM} permissions.
 
 \subsection{V4: NVFP4 with Software Microscaling}
 \label{sec:method:v4}
 
-V4 extends V3's structure to NVFP4 (E2M1) using the software-microscaled
-\texttt{mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32}.
-This instruction takes FP4 operands packed into byte containers with
-the FP4 occupying the \emph{middle} four bits of each byte
-(\texttt{0b00ABCD00}); CUDA's
+V4 extends V3's structure to NVFP4 (E2M1) using the software-
+microscaled \texttt{mma.sync.aligned.kind::f8f6f4.m16n8k32.\dots\
+.e2m1.e2m1.f32}. The instruction takes FP4 operands packed into
+byte containers with the FP4 in the middle four bits
+(\texttt{0b00ABCD00}). CUDA's
 \texttt{\_\_nv\_cvt\_float\_to\_fp4(\textperiodcentered, \_\_NV\_E2M1,
-cudaRoundNearest)} returns the FP4 in the low 4 bits and we shift left
-by 2 in our \texttt{f32\_to\_e2m1\_middle()} helper, following CUTLASS's
-\texttt{mma\_traits\_sm120.hpp} convention~\cite{nvidia2024cutlass}.
+cudaRoundNearest)} helper returns the FP4 in the low 4 bits and we
+shift left by 2 to position it in the middle, following CUTLASS's
+sm\_120 traits convention~\cite{nvidia2024cutlass}.
 
-\paragraph*{Why software microscaling, not the hardware
-\texttt{mxf4nvf4} path} NVIDIA's hardware-microscaled
-\texttt{mxf4nvf4.m16n8k64} instruction internalizes a per-16-element
-scale factor at the mma boundary and should be the structural V4 win.
-We \emph{do not} use it. Its A and B operand fragment layouts are
-decoded in CUTLASS's \texttt{mma\_traits\_sm120.hpp} as
-\emph{scattered} per-thread mappings (e.g., for thread 0, a single
-32-bit register holds 8 FP4 values at $(m, k)$ positions $(0,0), (0,16),
-(0,32), (0,48), (1,0), \ldots$), incompatible with the consecutive-byte
-row-major SMEM access pattern shared with V3. Engaging the family
-requires \texttt{ldmatrix}-style swizzled SMEM, a CUTLASS
-\texttt{CollectiveBuilder}-mediated load, or a custom warp-shuffle-based
-assembly that we estimate at multi-week scope. We document this as
-deferred work; the V4 result is honest about the resulting overhead.
+\paragraph*{Why software microscaling, not the hardware path}
+NVIDIA's hardware-microscaled \texttt{mxf4nvf4.m16n8k64} would in
+principle deliver a faster FP4 kernel by internalizing the per-block
+scale at the mma boundary. We \emph{do not} use it. Its A and B
+operand fragments are scattered per-thread (e.g., for thread 0, a
+single 32-bit register holds 8 FP4 values at $(m,k)$ positions
+$(0,0), (0,16), (0,32), (0,48), (1,0), \ldots$), incompatible with
+the consecutive-byte row-major SMEM access pattern V3 establishes.
+Engaging the family would require a swizzled SMEM layout and a
+CUTLASS-mediated load, which is multi-week scope. We document this
+as deferred work; V4's negative result is honest about the
+resulting overhead.
 
-\paragraph*{Per-row, per-K-block (block size 32) microscaling} V4
-maintains FP32 scales per row of $Q$ and per row of $K^\top$ and per
-column of $V$, each scale covering a 32-element block of the K dimension
-(matching the mma's K-stride). The scales are computed via per-warp
-shuffle reductions over the cooperative load (no cross-warp
-communication is required because warp\_id maps to col-strides of 32 =
-$\mathrm{KBLOCK}$). At each mma call, the 4 scalar B-scales for the
-four output columns multiply into the FP32 accumulator before
-accumulation; the 2 A-scales for the two output row-pairs $(g, g+8)$
-multiply directly into the per-thread accumulator slots. This adds
-approximately 12 register ops per mma call.
+\paragraph*{Per-row, per-K-block (block size 32) microscaling}
+V4 maintains FP32 scales per row of $Q$, per row of $K^\top$, and
+per column of $V$, with each scale covering a 32-element block of
+the K dimension---matching the mma's K-stride. Scales are computed
+via per-warp shuffle reductions during the cooperative load (no
+cross-warp communication needed because each warp's column stride
+is exactly the K-block size). At each mma call, four B-scales for
+the four output columns multiply into the FP32 accumulator before
+accumulation; two A-scales for the two output row-pairs multiply
+into the per-thread accumulator slots. This adds approximately
+12 register operations per mma call.
 
-\paragraph*{$V$ load reorganization} V's load pattern in V3 (thread
-$\mathit{tid}$ owns one column for many rows) does not yield per-(d,
-kb\_n) absmax without cross-warp reduction. V4 reorganizes V's load so
-thread $\mathit{tid}$ owns one $d$-position across a contiguous range
-of $n$-values. At $D = 128$, each thread covers $d = \mathit{tid}$ for
-all 64 $n$'s and computes 2 scales (kb\_n $\in \{0, 1\}$) via single-
-thread register reductions; at $D = 64$, two threads per $d$ each cover
-one (d, kb\_n).
+We use a 32-element microscaling block, not the NVFP4-standard
+16-element block. The 16-element standard is tied to the
+\texttt{mxf4nvf4.m16n8k64} hardware mma; on the
+\texttt{kind::f8f6f4.m16n8k32} path, reducing the block to 16 would
+require interleaving partial mma results, doubling either register
+pressure or mma call count. 32 is a defensible perf/granularity
+tradeoff for the path we target.
 
-\paragraph*{Block size 32, not the NVFP4-standard 16} We use a 32-element
-microscaling block because the \texttt{kind::f8f6f4.m16n8k32} mma's K
-dimension is 32. Reducing to 16 would require interleaving partial mma
-results, doubling either the register pressure or the number of mma
-calls. The NVFP4-standard 16-element block is tied to the
-\texttt{mxf4nvf4.m16n8k64} hardware mma; on the software-microscaled
-path, 32 is a defensible perf/granularity tradeoff.
+\paragraph*{V load reorganization}
+V3's V load pattern (one thread per column, many rows) does not
+yield per-(d, kb\_n) absmax without cross-warp reduction. V4
+reorganizes V's load so each thread owns one $d$-position across a
+contiguous range of $n$-values, allowing single-thread register
+reductions for the microscales. This is the only structural V4
+change beyond the microscaling logic itself.
 
-V4 emits 96 \texttt{QMMA.16832.F32.E2M1.E2M1} instructions across the
-$\mathrm{HEAD\_DIM} \in \{64, 128\}$ instantiations, the same count as
-V3, since the per-tile call structure is preserved and only the
-precision changes. V4's \texttt{setup.py} is the only one in our
-artifact targeting \texttt{sm\_120a} (architecture-accelerated) rather
-than plain \texttt{sm\_120}: ptxas rejects the \texttt{kind::f8f6f4}
-feature on the unsuffixed target.
+V4 emits 96 \texttt{QMMA.16832.F32.E2M1.E2M1} instructions across
+HEAD\_DIM $\in \{64, 128\}$, the same count as V3, since the
+per-tile call structure is preserved and only the precision
+changes. V4's \texttt{setup.py} is the only one in the artifact
+targeting \texttt{sm\_120a} (architecture-accelerated) rather than
+plain \texttt{sm\_120}: \texttt{ptxas} rejects the
+\texttt{kind::f8f6f4} feature on the unsuffixed target.
 
 % =============================================================================
 \section{Experimental Setup}
@@ -587,118 +829,107 @@ feature on the unsuffixed target.
 
 \paragraph*{Hardware} A single NVIDIA GeForce RTX~5080 (Blackwell,
 sm\_120a, 84 SMs, 16~GB GDDR7, peak memory bandwidth $\approx
-960$~GB/s)~\cite{nvidia2025blackwell}. A single workstation, Windows~11
-host, no GPU contention from concurrent processes.
+960$~GB/s)~\cite{nvidia2025blackwell}. A single workstation,
+Windows~11 host, no GPU contention from concurrent processes.
 
 \paragraph*{Software} CUDA Toolkit~12.8 (\texttt{nvcc} for kernel
-compilation), PyTorch~2.9.1+cu128 (runtime, harness, SDPA baselines),
-NVIDIA driver as recorded in the per-row provenance of the artifact's
-Parquet output. All five kernels build via
+compilation), PyTorch~2.9.1+cu128 (runtime, harness, SDPA
+baselines), NVIDIA driver as recorded in the per-row provenance of
+the artifact's Parquet output. All five kernels build via
 \texttt{torch.utils.cpp\_extension.CUDAExtension} with
 \texttt{-gencode=arch=compute\_120,code=sm\_120} for V0--V3 and
-\texttt{compute\_120a/sm\_120a} for V4 (Section~\ref{sec:method:v4}).
+\texttt{compute\_120a/sm\_120a} for V4.
 
 \paragraph*{Sweep grid} We benchmark seven sequence lengths
 $\{128,512,1024,2048,4096,8192,16384\}$ and two head dimensions
 $\{64,128\}$ at fixed batch size 2 and 8 attention heads, with FP16
 inputs and outputs and non-causal masking. The fixed
-$(\mathrm{batch}, \mathrm{heads})$ matches the V0--V4 session sweeps for
-direct comparability against documented baselines and avoids OOM at the
-$N = 16384$ entries for V0 and V1, whose memory cost is quadratic in
-$N$.
+$(\mathrm{batch}, \mathrm{heads})$ matches our V0--V4 development
+sweeps for direct comparability and avoids OOM at $N = 16384$ for
+V0 and V1, whose memory cost is quadratic in $N$.
 
-\paragraph*{Timing protocol} Per-iteration latencies are measured with
-paired \texttt{torch.cuda.Event}s (\texttt{enable\_timing=True}). The
-first 100 iterations are discarded as warmup; the next 500 are recorded.
-We report mean, median (p50), and 95\textsuperscript{th}/99\textsuperscript{th}
-percentiles per (variant, configuration) pair. \texttt{torch.cuda.synchronize()}
-is called once before the timed loop and after every iteration's stop
-event. \texttt{time.perf\_counter} is not used---it misses kernel-launch
-queueing and host/device sync cost~\cite{kalibera2013rigorous}. CUDA
-reductions (softmax row-sums, atomic adds) are not bitwise reproducible
-across launches; we accept this as a documented limitation and seed
-inputs deterministically per call.
+\paragraph*{Timing protocol} Per-iteration latencies use paired
+\texttt{torch.cuda.Event}s. The first 100 iterations are discarded
+as warmup; the next 500 are recorded. We report mean, p50, p95, and
+p99 per (variant, configuration). \texttt{torch.cuda.synchronize()}
+is called once before the timed loop and after every iteration's
+stop event. We do not use \texttt{time.perf\_counter}: it misses
+kernel-launch queueing and host/device sync
+cost~\cite{kalibera2013rigorous}. CUDA reductions (softmax row-
+sums, atomic adds) are not bitwise reproducible across launches; we
+accept this and seed inputs deterministically per call.
 
-\paragraph*{Clock state} Our consumer-Blackwell host does not have admin
-privileges available for \texttt{nvidia-smi -lgc}; clocks float during
-the sweep. We disclose this honestly per
-Kalibera-Jones~\cite{kalibera2013rigorous}: 500 timed iterations per
-configuration produce stable percentile statistics whose intra-config
-variance is dominated by the underlying clock dynamics. We report p95
-and p99 alongside the mean to surface tail behavior.
+\paragraph*{Clock state} Our consumer host has no admin privileges
+available for \texttt{nvidia-smi -lgc}; clocks float during the
+sweep. We disclose this honestly per
+Kalibera-Jones~\cite{kalibera2013rigorous}: 500 timed iterations
+per configuration produce stable percentile statistics, and we
+report p95 and p99 alongside the mean to surface tail behavior.
 
-\paragraph*{Accuracy methodology} For each configuration we compute the
-relative L2 error of the FP16 output against an FP32 reference produced
-by the V0 kernel (or by a direct FP32 PyTorch attention computation when
-V0 OOMs at long $N$):
+\paragraph*{Accuracy methodology} For each configuration we compute
+the relative L2 error of the FP16 output against an FP32 reference
+produced by V0 (or by a direct FP32 PyTorch attention computation
+when V0 OOMs at long $N$):
 \begin{equation}
   \mathrm{rel\_l2}(O, O_{\mathrm{ref}}) =
   \frac{\| O - O_{\mathrm{ref}} \|_2}{\| O_{\mathrm{ref}} \|_2}.
 \end{equation}
-We also test the bulk-correctness criterion ``$\geq 95\%$ of elements
-are within $5 \times 10^{-2}$ in absolute error, all elements finite,
-output magnitude bounded'' for the lower-precision variants, since
-strict per-element \texttt{torch.testing.assert\_close} is dominated by
-quantization noise V3 and V4 are not designed to suppress.
+We additionally check a bulk-correctness criterion ($\geq 95\%$ of
+elements within $5\times 10^{-2}$ in absolute error, all elements
+finite, output magnitude bounded) for the lower-precision variants.
+Strict per-element \texttt{torch.testing.assert\_close} is dominated
+by quantization noise V3 and V4 are not designed to suppress, so
+the bulk criterion is the relevant test.
 
-\paragraph*{SDPA dispatch on this PyTorch build} A finding worth
-foregrounding: the PyTorch~2.9.1+cu128 wheel we use was compiled
-\emph{without} flash-attention support
-(\texttt{Torch was not compiled with flash attention}, surfaced by the
-backend-probe warnings); cuDNN-attention and memory-efficient-attention
-are also runtime-disabled for our (sm\_120, FP16, non-causal) inputs.
-SDPA on this build therefore dispatches uniquely to the
-\texttt{MATH} backend---a pair of cuBLAS matmuls with a softmax in
-between, materializing the full $N \times N$ probability matrix in
-HBM. This means our SDPA baseline is the \emph{vendor's} FP16
-attention with no algorithmic fusion; any speed advantage SDPA exhibits
-over our V2/V3/V4 derives from cuBLAS's matmul tuning, not from
-FlashAttention. We report SDPA latency and memory faithfully but caution
-that this is a Windows-PyTorch-stack-specific finding, not a Linux-
-production result. We attempted to pin the dispatch to
-\texttt{FLASH\_ATTENTION} and \texttt{CUDNN\_ATTENTION} via
-\texttt{torch.nn.attention.sdpa\_kernel}; both were rejected at runtime.
-The vLLM project~\cite{vllm2025issue14452} explicitly documents that
-the FA3 backend does not yet work with consumer
-Blackwell~\cite{vllm2025issue29030} (SM~12.0 is not a superset of
-SM~10.0); the NVIDIA Transformer Engine test
-suite~\cite{te2025issue2186} maintains an FP8-attention skip list (THD
-layout, bias, sliding window, MLA-CP); FlashInfer FP8 attention has a
-documented Blackwell correctness regression~\cite{vllm2026issue35138}
-that recommends a backend switch rather than a precision change. Our
-SDPA-dispatches-to-MATH finding is one observation in a larger pattern
-of consumer-Blackwell-attention-stack-immaturity that the broader
-ecosystem has been independently surfacing.
+\paragraph*{SDPA dispatch on this PyTorch build}
+The PyTorch~2.9.1+cu128 wheel we use was compiled \emph{without}
+flash-attention support (\texttt{Torch was not compiled with flash
+attention}, surfaced by the backend-probe warnings). cuDNN-attention
+and memory-efficient-attention are also runtime-disabled for our
+(sm\_120, FP16, non-causal) inputs. SDPA on this build dispatches
+uniquely to the \texttt{MATH} backend---a pair of cuBLAS matmuls
+with a softmax in between, materializing the full $N \times N$
+probability matrix in HBM. This means our SDPA baseline is the
+vendor's FP16 attention without algorithmic fusion; any speed
+advantage SDPA exhibits over our V2/V3/V4 derives from cuBLAS's
+matmul tuning, not from FlashAttention. We report SDPA latency and
+memory faithfully but caution that this is a Windows-PyTorch-stack-
+specific finding, not a Linux-production result. We attempted to
+pin the dispatch to \texttt{FLASH\_ATTENTION} and
+\texttt{CUDNN\_ATTENTION} via \texttt{sdpa\_kernel}; both raised
+\texttt{NoBackendError} at runtime.
 
-\paragraph*{Tensor Core engagement} Rather than rely on Nsight Compute
-metrics (gated by \texttt{ERR\_NVGPUCTRPERM} on consumer GPUs without
-admin), we verify Tensor Core engagement directly from the cubin via
-\texttt{cuobjdump --dump-sass | Select-String QMMA} (FP8/FP4) or
-\texttt{HMMA} (FP16). The mnemonic counts are reported per variant.
+\paragraph*{Tensor Core engagement} Rather than rely on Nsight
+Compute (gated by \texttt{ERR\_NVGPUCTRPERM} on consumer GPUs
+without admin), we verify Tensor Core engagement directly from the
+cubin via \texttt{cuobjdump --dump-sass | Select-String QMMA}
+(FP8/FP4) or \texttt{HMMA} (FP16). Mnemonic counts are reported per
+variant in Section~\ref{sec:results}.
 
 \paragraph*{Reproducibility} Every benchmark output records driver
-version, torch version, CUDA version, GPU model, timestamp, and short
-git commit hash. The artifact's single-command reproduction is
-described in Appendix~\ref{app:repro}.
+version, torch version, CUDA version, GPU model, timestamp, and
+short git commit hash. The artifact's single-command reproduction
+is described in Appendix~\ref{app:repro}.
 
 % =============================================================================
 \section{Results}
 \label{sec:results}
 
-We discuss the Pareto frontier first (Figure~\ref{fig:pareto}), then
-the memory-, latency-, and accuracy-axes individually.
+We present the Pareto frontier first (Figure~\ref{fig:pareto}), then
+discuss memory, latency, accuracy, and Tensor-Core engagement axes
+individually.
 
 \begin{figure*}[t]
   \centering
   \includegraphics[width=0.95\textwidth]{figures/fig_pareto_main.pdf}
   \caption{Latency--accuracy Pareto frontier on RTX~5080 at seq\_len
     $\in\{8192, 16384\}$, head\_dim$=128$, batch$=2$, num\_heads$=8$.
-    Each point is one (variant, configuration) pair; the y-axis is the
-    relative L2 error against an FP32 reference, the x-axis is the mean
-    measured latency over 500 iterations after 100-iteration warmup. V0
-    (FP32) and V1 (FP16 tiled) trail off-frame in latency; V2 (FP16
-    fused) is the algorithmic-fusion data point; V3 (FP8) is on the
-    optimal frontier; V4 (NVFP4 with software microscaling) is
+    Each point is one (variant, configuration) pair; the y-axis is
+    relative L2 error against an FP32 reference, the x-axis is mean
+    measured latency over 500 iterations after 100-iteration warmup.
+    V0 (FP32) and V1 (FP16 tiled) trail off-frame in latency; V2
+    (FP16 fused) is the algorithmic-fusion data point; V3 (FP8) is
+    on the optimal frontier; V4 (NVFP4 with software microscaling) is
     dominated by V3 in this configuration. SDPA dispatches to the
     \texttt{MATH} backend on this PyTorch build.}
   \label{fig:pareto}
@@ -707,8 +938,8 @@ the memory-, latency-, and accuracy-axes individually.
 \subsection{Pareto Overview}
 
 Figure~\ref{fig:pareto} is the paper's headline. At
-seq\_len$=8192$, head\_dim$=128$ the Pareto-optimal points are
-SDPA (lowest latency, lowest error among non-FP32 variants) and V3
+seq\_len$=8192$, head\_dim$=128$, the Pareto-optimal points are SDPA
+(lowest latency, lowest error among non-FP32 variants) and V3
 (lowest latency among hand-rolled kernels at the FP8 error level).
 V4 sits at higher latency and higher error than V3---it is dominated
 by V3 in every dimension except theoretical FP4 throughput, which
