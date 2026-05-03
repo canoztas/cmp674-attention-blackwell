@@ -1,0 +1,28 @@
+# V1 sweep config - FP16 counterpart to sweep_default.yaml.
+#
+# Same shape grid as the V0 sweep so V0 (FP32, from sweep_default) and V1
+# (FP16, this file) are directly comparable at fixed (B, H, N, D); the only
+# delta is the precision the variant runs at, which is the V0->V1 ablation.
+#
+# Memory bound at the largest config:
+#   batch=4, num_heads=16, seq_len=2048, head_dim=128, FP16
+#   peak intermediate (S in HBM) = 4*16*2048*2048*2 bytes = 1.0 GiB
+# Comfortably fits the 16 GiB RTX 5080.
+#
+# Warmup/iter: 100/200, ~4x V0's 25/100. V0's snapshot is preserved as-is
+# (bench/results/v0_initial.parquet) for paper reproducibility; V1 gets
+# tighter statistics because its faster kernel allows it without blowing
+# the wall-clock budget.
+
+sweep:
+  name: v1_initial
+  num_warmup: 100
+  num_iter: 200
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048]
+    head_dim: [64, 128]
+    batch_size: [4]
+    num_heads: [16]
+    dtype: ["torch.float16"]
+    causal: [false]

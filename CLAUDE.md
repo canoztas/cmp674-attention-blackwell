@@ -39,53 +39,78 @@ runtime deps are not declared there.
 
 ## Variant roadmap
 
-| ID  | Precision   | Design                                                          | Status          |
-| --- | ----------- | --------------------------------------------------------------- | --------------- |
-| V0  | FP32        | Naive — materializes the full N×N attention matrix in HBM        | **In progress** |
-| V1  | FP16        | Tiled, Tensor Core (WMMA / CUTLASS), still materializes outputs  | Pending         |
-| V2  | FP16        | Fused + online softmax (FlashAttention-style)                    | Pending         |
-| V3  | FP8 (E4M3)  | V2 + per-tile scaling                                            | Pending         |
-| V4  | FP4 (NVFP4) | V3 + microscaling (Blackwell-only, exploratory)                  | Pending         |
+| ID  | Precision   | Design                                                                | Status      |
+| --- | ----------- | --------------------------------------------------------------------- | ----------- |
+| V0  | FP32        | Naive — materializes the full N×N attention matrix in HBM             | **Done**    |
+| V1  | FP16        | Tiled, Tensor Core (hand-rolled WMMA), still materializes outputs     | **Done**    |
+| V2  | FP16        | Fused + online softmax (FlashAttention-style)                         | Pending     |
+| V3  | FP8 (E4M3)  | V2 + per-tile scaling                                                 | Pending     |
+| V4  | FP4 (NVFP4) | V3 + microscaling (Blackwell-only, exploratory)                       | Pending     |
 
-**One variant per session.** V0 must be complete and tested before V1. V0 is
-intentionally slow and obvious — its job is correctness baseline + worst case.
+**One variant per session.** V0 was the correctness baseline + worst case.
+V1 isolates the contribution of *tiling + Tensor Cores* before V2 adds
+fusion. V1 went WMMA over CUTLASS for didactic clarity and zero install
+risk; V2 may revisit that decision (CUTLASS's `CollectiveEpilogue` is more
+compelling for fused kernels).
 
 ## Build / test / benchmark commands
 
-All commands run from the repo root with the `gpu` venv activated.
+All commands run from the repo root with the `gpu` venv activated. Interactive
+shells use the user's `gpu` PowerShell function; **non-interactive shells**
+(automation, IDE-spawned terminals) instead dot-source the project's helper:
 
 ```powershell
-# Toolchain validation (run after `gpu`, first thing each session)
+. .\env\activate_for_build.ps1   # vcvars + CUDA + ncu + conda gpu env
+```
+
+Both achieve the same result; `gpu` and `activate_for_build.ps1` are
+interchangeable for everything below.
+
+```powershell
+# Toolchain validation (first thing each session)
 python env/check_env.py
 
 # Install / refresh pinned deps
 pip install -r env/requirements.txt
 
-# Build a kernel extension (editable, idempotent, AOT)
-pip install -e kernels/v0_naive_fp32
+# Build kernel extensions (editable, idempotent, AOT)
+pip install --no-build-isolation -e kernels/v0_naive_fp32
+pip install --no-build-isolation -e kernels/v1_tiled_fp16
 
-# Run all tests
+# Run all tests (217 expected)
 pytest
 
-# Run V0 correctness tests only
-pytest tests/test_correctness.py
+# Run a single variant's correctness tests
+pytest tests/test_correctness.py -k v1
 
-# Run V0 benchmark sweep
+# Run V0 paper snapshot (FP32 sweep, V0-PT + V0-CU + SDPA)
 python bench/run_v0.py
 
-# Generate the V0 figure
+# Run V1 sweep (FP16, V1-CU + SDPA)
+python bench/run_all.py --variants sdpa v1_tiled_cu `
+    --config bench/configs/sweep_v1.yaml `
+    --output bench/results/v1_initial.parquet
+
+# Generate figures
 python analysis/plot_v0_initial.py
+python analysis/plot_v1_vs_v0.py
+
+# Verify Tensor Core engagement (no admin needed; reads cubin SASS)
+cuobjdump --dump-sass kernels/v1_tiled_fp16/_C.cp311-win_amd64.pyd | Select-String HMMA
 ```
 
 ## Repository layout
 
 - [env/check_env.py](env/check_env.py) — toolchain validation; run first thing each session.
 - [env/requirements.txt](env/requirements.txt) — pinned deps; install inside the `gpu` venv.
+- [env/activate_for_build.ps1](env/activate_for_build.ps1) — non-interactive PowerShell
+  helper: vcvars64.bat + `CUDA_HOME` + Nsight Compute on PATH + conda `gpu` activation.
+  Dot-source it in shells where the user's `gpu` profile function isn't available.
 - `kernels/v{0..4}_<name>/` — one directory per variant. Each has its own `setup.py`
-  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. V0 is implemented;
-  V1–V4 are skeletons (compilable stubs that raise at runtime) so future sessions
-  skip the boilerplate. Variant directories: `v0_naive_fp32`, `v1_tiled_fp16`,
-  `v2_flash_fp16`, `v3_flash_fp8`, `v4_flash_nvfp4`.
+  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. V0 and V1 are
+  implemented; V2–V4 are skeletons (compilable stubs that raise at runtime) so
+  future sessions skip the boilerplate. Variant directories: `v0_naive_fp32`,
+  `v1_tiled_fp16`, `v2_flash_fp16`, `v3_flash_fp8`, `v4_flash_nvfp4`.
 - [bench/harness.py](bench/harness.py) — core benchmarking machinery (CUDA event timing, p50/p95/p99,
   forward-compatible Parquet schema all variants share).
 - [bench/run_v0.py](bench/run_v0.py) — V0 paper-experiment driver (V0-PT, V0-CU, SDPA over
@@ -93,7 +118,8 @@ python analysis/plot_v0_initial.py
 - [bench/run_all.py](bench/run_all.py) — long-lived master comparison driver. Resolves
   the variant registry at startup and gracefully skips variants whose extension
   isn't built yet. Use this from V1 onwards.
-- `bench/configs/` — YAML sweep configs.
+- `bench/configs/` — YAML sweep configs. `sweep_default.yaml` is FP32 (V0);
+  `sweep_v1.yaml` is the FP16 twin used by V1+ (same shape grid, different dtype).
 - `bench/results/` — Parquet output (gitignored except `.gitkeep`).
 - [tests/test_correctness.py](tests/test_correctness.py) — every kernel ships with a passing correctness test
   against the PyTorch reference. **A kernel without a passing test does not get committed.**
@@ -125,10 +151,18 @@ python analysis/plot_v0_initial.py
 
 ## Deferred work (do NOT do until the relevant variant session)
 
-- V1, V2, V3, V4 implementations.
-- V0 optimization. V0 is intentionally slow and obvious.
+- V2, V3, V4 implementations.
+- V0 / V1 optimization. V0 is intentionally slow and obvious; V1 picks
+  defensible tile defaults (BR=BC=BD=64) — tile-shape tuning is V2+ work.
+- Tensor Core engagement profiling via Nsight Compute. Blocked on
+  consumer-driver `ERR_NVGPUCTRPERM`; cubin SASS check (`cuobjdump | grep HMMA`)
+  is sufficient through V2 and doesn't need admin.
+- Re-running V0 at higher iteration count for statistical parity with V1.
+  V0's 25-warmup / 100-iter snapshot is good enough for the figure; revisit
+  if a paper reviewer asks.
 - CI / GitHub Actions.
-- CUTLASS, Transformer Engine, FlashInfer installs.
+- CUTLASS, Transformer Engine, FlashInfer installs. Reconsider CUTLASS at
+  V2 (CollectiveEpilogue pays off for fused softmax).
 - Paper text. `paper/` stays empty until V3+.
 
 ## Reference papers (cite, don't re-read each session)
@@ -207,29 +241,117 @@ the "why is the build doing X?" questions you would otherwise hit again.
   set `CUDA_HOME`, or add Nsight Compute to PATH — that snippet was provided
   separately and the user will apply it before the next session.
 
+## Lessons from V1 session
+
+Captured because each cost real time and none are obvious from the code or git
+history. Read before starting V2.
+
+- **Non-interactive PowerShell can't use the `gpu` profile function.** The user's
+  interactive `gpu` activates conda + sets paths, but profile functions don't load
+  in non-interactive shells (the ones automation spawns). Solution: a project-level
+  helper at [env/activate_for_build.ps1](env/activate_for_build.ps1) that sources
+  vcvars64.bat, sets `CUDA_HOME` + `CUDA_PATH`, prepends Nsight Compute, and
+  activates the conda `gpu` env. Dot-source it at the start of every PowerShell
+  call: `. .\env\activate_for_build.ps1`. The interactive `gpu` function still works
+  for terminal use; this file only matters for tooling.
+- **PowerShell 5.1 reads `.ps1` files in the OS ANSI codepage by default**,
+  not UTF-8. The `Write` tool emits UTF-8 without BOM. Non-ASCII characters
+  (em-dashes, smart quotes, etc.) get reinterpreted mid-file and break the
+  parser with confusing "string is missing the terminator" errors at lines
+  *after* the bad character. Stick to ASCII in PowerShell scripts, or write
+  with a UTF-8 BOM if non-ASCII is necessary.
+- **PowerShell 5.1 wraps native-command stderr as `NativeCommandError`** with
+  exit code 1 — even when the command exited 0. Python's `logging` module
+  writes INFO-level messages to stderr, so `python script.py` looks like a
+  failure under PowerShell's strict-mode handling. The script *did* run; the
+  noise just masks success. If you need a clean exit code, run via
+  `python -c "..."` with prints to stdout, or accept that `2>&1` and `Out-String`
+  don't fix it (the wrapping happens in PowerShell's host, not the redirector).
+  Don't waste time chasing "errors" that match this pattern.
+- **PowerShell 5.1 can mis-parse `|` inside double-quoted argument strings**
+  passed to native commands. ncu's `--kernel-name "regex:foo|bar"` was
+  treating `bar` as a separate command. Workaround: avoid `|` in regex args
+  to native tools, or run two invocations and concatenate.
+- **Nsight Compute on consumer GPUs requires admin** for performance-counter
+  access (`ERR_NVGPUCTRPERM`). On RTX 5080 + non-elevated shell this blocks
+  ncu's per-kernel metrics. **Better proxy for "are Tensor Cores engaged?":
+  `cuobjdump --dump-sass <pyd> | grep HMMA`.** This reads the actual emitted
+  machine code — `HMMA.16816.F32` is the Blackwell Tensor Core instruction
+  for FP16-in / FP32-acc. V1 emits 120 HMMA instructions in `qk_tile_kernel`
+  and 32 in `pv_tile_kernel`, with zero in `softmax_fp16_kernel` (FP32 ALU,
+  as expected). This is *more* rigorous than ncu's sampled metric — it's the
+  cubin itself.
+- **WMMA `matrix_b col_major` is the ergonomic way to do `Q @ K^T` without an
+  explicit transpose pass.** K is row-major (BC, D). Declaring B as
+  `matrix_b col_major` with `ldm = D` and pointer `K_smem + n*WMMA_N*D + k0`
+  makes B equal to K^T because col-major stride pattern `ptr[k + n*ldm]`
+  matches row-major K's element layout. No data movement, no extra kernel.
+  This pattern transfers directly to V2.
+- **CUTLASS-vs-WMMA: WMMA was the right call for V1** despite the kickoff's
+  lean toward CUTLASS. Build-and-iterate cycle in seconds (CUTLASS would be
+  multi-minute), zero install risk on a brand-new sm_120 toolchain, didactic
+  clarity for the methodology section. CUTLASS's `CollectiveEpilogue` advantage
+  doesn't materialize until V2's online softmax fusion. If V2 wants CUTLASS,
+  switch then; V1's WMMA path becomes the "hand-rolled Tensor Core baseline"
+  data point for the paper.
+- **Per-precision sweep configs are inevitable.** V0 takes FP32, V1 takes
+  FP16, the harness has one `dtype` per sweep YAML. Solution:
+  [bench/configs/sweep_v1.yaml](bench/configs/sweep_v1.yaml) is the FP16
+  twin of `sweep_default.yaml` with the same shape grid; the V1-vs-V0 plot
+  reads both Parquets and joins on `(seq_len, head_dim)`. Each variant
+  benchmarked at its native precision is the honest comparison for the paper.
+- **FP16 cumulative rounding is the real signal at high input variance**, not
+  a kernel bug. V1 stores S and P in FP16 between phases, which compounds
+  ~`eps_fp16` per stored value across the PV reduction. Measured: at unit
+  variance, max abs err ~2e-3 (well under the 1e-2 tolerance). At std=2 a
+  single element drifts past 1e-2; at std=3 ~0.3% of elements; at std=5
+  ~1.3%. None are bugs — they are V1's design envelope. The strict 1e-2
+  tolerance is right for the main grid; high-variance stress tests should
+  verify *finiteness + bulk-correctness* (no NaN, ≥95% within 5e-2), which
+  rules out indexing/accumulator bugs without false-failing on FP16 noise
+  V1 was never designed to suppress. V3's per-tile FP8 scaling is what
+  fixes this regime.
+- **Static `__shared__` arrays count toward the per-block 48KB cap on
+  Blackwell.** Pulling all smem into a single dynamic allocation
+  (`extern __shared__ unsigned char smem_raw[]; ...reinterpret_cast`)
+  centralizes the budget and avoids surprise cap hits. V1's QK kernel at
+  D=128 totals exactly 48KB (32KB FP16 tiles + 16KB FP32 scratch) — at the
+  default cap with no headroom; if V2 grows the tile, opt-in via
+  `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, ...)`.
+- **Performance, measured.** V1 lands 4.5–10.9× over V0 across the grid
+  (8.3–8.6× at seq_len=2048); SDPA is 3–9× faster than V1, with the gap
+  widening at large seq_len because SDPA uses FlashAttention's online
+  softmax + fused kernel — exactly what V2 introduces. V1 catching SDPA at
+  this stage would have been a correctness-bug signal, not a victory.
+
 ## Current status
 
-**Session 1 — V0 complete + V1–V4 scaffolding in place.** Toolchain end-to-end
-green: VS Build Tools 2022 (MSVC 14.44) + CUDA Toolkit 12.8 + Nsight Compute
-2025.1.1 installed and on PATH; `env/check_env.py` reports 10/10 PASS; V0-CU kernel
-(`kernels/v0_naive_fp32/`) builds for sm_120 via `pip install -e`; 147/147 pytest
-tests pass (V0-CU vs V0-PT atol=1e-5, both vs `F.scaled_dot_product_attention`
-atol=1e-4); first sweep produced 2400 rows in `bench/results/v0_initial.parquet`
-(24 (variant, config) results × 100 iterations) and the precursor figure at
-`analysis/figures/v0_initial.png`.
+**Session 2 — V1 complete + V0 preserved + V2–V4 still stubs.** All 217 pytest
+tests pass: 147 V0 (unchanged) + 70 V1 (V0-PT FP32 reference at atol=1e-2 on
+the V1 grid + causal + non-aligned seq_len + small-magnitude adversarial +
+high-variance stress tests + dtype/head_dim rejection). V1-CU
+(`kernels/v1_tiled_fp16/`) builds for sm_120 via `pip install -e`; 152 HMMA
+Tensor Core instructions in the cubin (120 in `qk_tile_kernel`, 32 in
+`pv_tile_kernel`, 0 in softmax). Sweep produced 3200 rows in
+`bench/results/v1_initial.parquet` (16 (variant, config) results × 200
+iterations of V1 + SDPA on FP16); figure at `analysis/figures/v1_vs_v0.png`
+shows V1 8.3–8.6× V0 at seq_len=2048.
 
-V1–V4 directories exist as compilable stubs (`setup.py` + `binding.cpp` +
-`attention_v{N}.cu` + `__init__.py` each). Their `setup.py` already targets
-sm_120 + applies `-DUSE_CUDA` on Windows + uses `/O2` for cxx; the `.cu` body
-is a `TORCH_CHECK(false, "not yet implemented")` stub. Future sessions can
-`pip install -e kernels/v{N}_<name>` immediately to smoke-test the build pipeline,
-then fill in the kernel body. `bench/run_all.py` resolves the variant registry at
-startup and gracefully skips un-built variants — runs cleanly today with V0 + SDPA.
+V2–V4 directories remain compilable stubs. `bench/run_all.py` resolves the
+registry at startup and runs cleanly with V0 + V1 + SDPA today, gracefully
+skipping V2–V4 stubs. Build-env helper at
+[env/activate_for_build.ps1](env/activate_for_build.ps1) handles
+non-interactive PowerShell sessions (the user's `gpu` profile function
+covers terminal use).
 
-**Next session — V1.** FP16 tiled with WMMA / CUTLASS, still materializing outputs.
-First action of the V1 session: re-run `python env/check_env.py` to confirm the
-toolchain is still healthy, then `pip install -e kernels/v1_tiled_fp16` to verify
-the stub builds, then decide between hand-rolled WMMA and CUTLASS templates for the
-two matmuls and start there. CUTLASS install is also deferred to that session.
+**Next session — V2.** FlashAttention-style: online softmax + single-kernel
+fusion, FP16 in/out, FP32 accumulators. First action: re-run
+`. .\env\activate_for_build.ps1; python env/check_env.py` (10/10 PASS expected),
+then `pip install -e kernels/v2_flash_fp16` to confirm the stub builds. Then
+decide CUTLASS vs hand-rolled WMMA again — V2 is where CUTLASS's
+`CollectiveEpilogue` advantage actually pays off, so the trade-off rebalances
+in CUTLASS's favor. If CUTLASS is chosen, install as a git submodule under
+`external/cutlass/` and verify a minimal sm_120 GEMM example before writing
+the V2 body.
 
 Update this section at the end of every session.
