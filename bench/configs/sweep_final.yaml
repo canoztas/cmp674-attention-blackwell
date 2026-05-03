@@ -1,0 +1,38 @@
+# Final paper sweep -- single Parquet that all paper figures derive from.
+#
+# Grid: full seq_len + head_dim coverage at fixed (batch=2, num_heads=8) so
+# the longitudinal latency vs seq_len plot is a clean story. The existing
+# V0..V4 sweeps used the same (b, h) so this is directly comparable to those
+# snapshots.
+#
+# Variants:
+#   - v0_naive_pt, v0_naive_cu (FP32 reference + naive CUDA)
+#   - v1_tiled_cu, v2_flash_cu, v3_flash_cu, v4_flash_cu
+#   - sdpa (default backend dispatch -- treated as "what users get")
+#   - sdpa_cudnn (pinned to torch.nn.attention.SDPBackend.CUDNN_ATTENTION)
+#   - sdpa_flash (pinned to torch.nn.attention.SDPBackend.FLASH_ATTENTION)
+#
+# Pinning lets the paper attribute SDPA's perf/accuracy to a specific dispatch
+# (mid-2026 PyTorch dispatches FlashAttention-2 in FP16 on consumer Blackwell,
+# not FP8); the comparison is honest only if the backend is named.
+#
+# V0 will OOM at long seq_lens. The harness skips OOM gracefully -- those
+# rows just won't appear in the parquet.
+#
+# Iteration counts: 100 warmup, 500 measured. 100 warmup is enough to get
+# past clock ramp + JIT; 500 gives stable p50/p95/p99 (std error scales as
+# 1/sqrt(N)). The V3/V4 session sweeps used 50/100; we tighten for the
+# paper's headline numbers.
+
+sweep:
+  name: paper_final
+  num_warmup: 100
+  num_iter: 500
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048, 4096, 8192, 16384]
+    head_dim: [64, 128]
+    batch_size: [2]
+    num_heads: [8]
+    dtype: ["torch.float16"]
+    causal: [false]

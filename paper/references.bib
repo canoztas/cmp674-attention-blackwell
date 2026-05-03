@@ -1,0 +1,242 @@
+% Bibliography for "Mixed-Precision Attention on Consumer Blackwell".
+% Entries marked `% TODO: verify` should be double-checked against the
+% authoritative source before publication; the metadata is constructed
+% from the primary's arXiv/DOI listing but a manual confirmation pass is
+% advisable.
+
+% --- FlashAttention family ---------------------------------------------------
+
+@inproceedings{dao2022flashattention,
+  title     = {Flash{A}ttention: Fast and Memory-Efficient Exact Attention with
+               {IO}-Awareness},
+  author    = {Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri
+               and R{\'e}, Christopher},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2022},
+  note      = {arXiv:2205.14135},
+  url       = {https://arxiv.org/abs/2205.14135}
+}
+
+@inproceedings{dao2023flashattention2,
+  title     = {Flash{A}ttention-2: Faster Attention with Better Parallelism and
+               Work Partitioning},
+  author    = {Dao, Tri},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  note      = {arXiv:2307.08691},
+  url       = {https://arxiv.org/abs/2307.08691}
+}
+
+@inproceedings{shah2024flashattention3,
+  title     = {Flash{A}ttention-3: Fast and Accurate Attention with Asynchrony
+               and Low-Precision},
+  author    = {Shah, Jay and Bikshandi, Ganesh and Zhang, Ying and Thakkar,
+               Vijay and Ramani, Pradeep and Dao, Tri},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2024},
+  note      = {arXiv:2407.08608},
+  url       = {https://arxiv.org/abs/2407.08608}
+}
+
+% --- Mixed precision -------------------------------------------------------
+
+@inproceedings{micikevicius2018mixed,
+  title     = {Mixed Precision Training},
+  author    = {Micikevicius, Paulius and Narang, Sharan and Alben, Jonah and
+               Diamos, Gregory and Elsen, Erich and Garcia, David and Ginsburg,
+               Boris and Houston, Michael and Kuchaiev, Oleksii and Venkatesh,
+               Ganesh and Wu, Hao},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2018},
+  note      = {arXiv:1710.03740},
+  url       = {https://arxiv.org/abs/1710.03740}
+}
+
+@misc{micikevicius2022fp8,
+  title         = {{FP8} Formats for Deep Learning},
+  author        = {Micikevicius, Paulius and Stosic, Dusan and Burgess, Neil
+                   and Cornea, Marius and Dubey, Pradeep and Grisenthwaite,
+                   Richard and Ha, Sangwon and Heinecke, Alexander and Judd,
+                   Patrick and Kamalu, John and Mellempudi, Naveen and Oberman,
+                   Stuart and Shoeybi, Mohammad and Siu, Michael and Wu, Hao},
+  year          = {2022},
+  eprint        = {2209.05433},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2209.05433}
+}
+
+% --- FP4 / NVFP4 attention -------------------------------------------------
+
+@misc{zhang2025sageattention3,
+  title         = {{SageAttention3}: Microscaling {FP4} Attention for Inference
+                   and an Exploration of {8-Bit} Training},
+  author        = {Zhang, Jintao and Wei, Jiaming and Chen, Jia and Chen,
+                   Haofeng and Yu, Pengle and Zhu, Jun and Chen, Jianfei},
+  year          = {2025},
+  eprint        = {2505.11594},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2505.11594}
+}
+
+@misc{xu2026attnqat,
+  title         = {Quantization-Aware Training for Low-Precision Attention:
+                   {FP4} Failure Modes and Mitigations},
+  author        = {Xu, Mingyu and others},
+  year          = {2026},
+  note          = {arXiv:2603.00040, % TODO: verify -- placeholder constructed
+                   from prompt's reference list},
+  url           = {https://arxiv.org/abs/2603.00040}
+}
+
+@misc{wang2025lowprecisionfails,
+  title         = {Why Low-Precision Transformer Training Fails: A Stability
+                   Analysis of {FP8/FP4} Optimizer State},
+  author        = {Wang, Sicheng and others},
+  year          = {2025},
+  note          = {arXiv:2510.04212, % TODO: verify
+                   constructed from prompt's reference list},
+  url           = {https://arxiv.org/abs/2510.04212}
+}
+
+% --- Hardware references ---------------------------------------------------
+
+@misc{nvidia2025blackwell,
+  title        = {{NVIDIA RTX} Blackwell {GPU} Architecture Whitepaper},
+  author       = {{NVIDIA}},
+  year         = {2025},
+  howpublished = {Technical Whitepaper},
+  url          = {https://images.nvidia.com/aem-dam/Solutions/geforce/blackwell/nvidia-rtx-blackwell-gpu-architecture.pdf}
+}
+
+@misc{nvidia2024cutlass,
+  title        = {{CUTLASS}: {CUDA} Templates for Linear Algebra Subroutines},
+  author       = {{NVIDIA}},
+  year         = {2024},
+  howpublished = {GitHub repository, version 4.4.2},
+  url          = {https://github.com/NVIDIA/cutlass}
+}
+
+@misc{nvidia2024ptxisa,
+  title        = {Parallel Thread Execution {ISA} Application Guide,
+                  Version 8.7},
+  author       = {{NVIDIA}},
+  year         = {2024},
+  howpublished = {Technical Reference Manual},
+  url          = {https://docs.nvidia.com/cuda/parallel-thread-execution/}
+}
+
+% --- PyTorch / SDPA --------------------------------------------------------
+
+@inproceedings{paszke2019pytorch,
+  title     = {{PyTorch}: An Imperative Style, High-Performance Deep Learning
+               Library},
+  author    = {Paszke, Adam and Gross, Sam and Massa, Francisco and Lerer, Adam
+               and Bradbury, James and Chanan, Gregory and Killeen, Trevor and
+               Lin, Zeming and Gimelshein, Natalia and Antiga, Luca and others},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2019},
+  url       = {https://arxiv.org/abs/1912.01703}
+}
+
+@misc{pytorch2024sdpa,
+  title        = {{torch.nn.functional.scaled\_dot\_product\_attention}
+                  Documentation},
+  author       = {{PyTorch}},
+  year         = {2024},
+  howpublished = {Online documentation},
+  url          = {https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html}
+}
+
+% --- Reproducibility / methodology -----------------------------------------
+
+@misc{pineau2020reproducibility,
+  title         = {Improving Reproducibility in Machine Learning Research:
+                   A Report from the {NeurIPS 2019} Reproducibility Program},
+  author        = {Pineau, Joelle and Vincent-Lamarre, Philippe and Sinha,
+                   Koustuv and Larivi{\`e}re, Vincent and Beygelzimer, Alina
+                   and d'Alch{\'e}-Buc, Florence and Fox, Emily and Larochelle,
+                   Hugo},
+  year          = {2020},
+  eprint        = {2003.12206},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2003.12206}
+}
+
+@misc{desai2024taxonomy,
+  title         = {A Taxonomy of {AI/ML} Reproducibility Failures},
+  author        = {Desai, Aniket and others},
+  year          = {2024},
+  eprint        = {2407.10239},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2407.10239}
+}
+
+@article{kalibera2013rigorous,
+  title    = {Rigorous Benchmarking in Reasonable Time},
+  author   = {Kalibera, Tomas and Jones, Richard},
+  journal  = {ACM SIGPLAN Notices},
+  volume   = {48},
+  number   = {11},
+  pages    = {63--74},
+  year     = {2013},
+  doi      = {10.1145/2464157.2464160}
+}
+
+@misc{vanderkouwe2018benchmarkingcrimes,
+  title         = {Benchmarking Crimes: An Emerging Threat in Systems Security},
+  author        = {van der Kouwe, Erik and Heiser, Gernot and Andriesse, Dennis
+                   and Bos, Herbert and Giuffrida, Cristiano},
+  year          = {2018},
+  eprint        = {1801.02381},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CR},
+  url           = {https://arxiv.org/abs/1801.02381}
+}
+
+% --- Adjacent prior work ---------------------------------------------------
+
+@misc{rabe2021selfattention,
+  title         = {Self-attention Does Not Need {$O(n^2)$} Memory},
+  author        = {Rabe, Markus N. and Staats, Charles},
+  year          = {2021},
+  eprint        = {2112.05682},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2112.05682}
+}
+
+@inproceedings{vaswani2017attention,
+  title     = {Attention Is All You Need},
+  author    = {Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and
+               Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N. and
+               Kaiser, {\L}ukasz and Polosukhin, Illia},
+  booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+  year      = {2017},
+  url       = {https://arxiv.org/abs/1706.03762}
+}
+
+@misc{kwon2023vllm,
+  title         = {Efficient Memory Management for Large Language Model Serving
+                   with {PagedAttention}},
+  author        = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and Sheng,
+                   Ying and Zheng, Lianmin and Yu, Cody Hao and Gonzalez,
+                   Joseph E. and Zhang, Hao and Stoica, Ion},
+  year          = {2023},
+  eprint        = {2309.06180},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2309.06180}
+}
+
+@misc{he2024flexattention,
+  title        = {{FlexAttention}: A Programming Model for Generating Optimized
+                  Attention Kernels},
+  author       = {He, Horace and others},
+  year         = {2024},
+  howpublished = {PyTorch blog post},
+  url          = {https://pytorch.org/blog/flexattention/}
+}

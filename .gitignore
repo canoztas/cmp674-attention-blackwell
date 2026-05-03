@@ -20,6 +20,18 @@ dist/
 
 # Benchmark outputs (directory kept via .gitkeep)
 bench/results/*.parquet
+bench/results/*.log
+
+# LaTeX build artifacts (paper/main.pdf IS committed)
+paper/main.aux
+paper/main.bbl
+paper/main.blg
+paper/main.fdb_latexmk
+paper/main.fls
+paper/main.log
+paper/main.out
+paper/main.toc
+paper/main.synctex.gz
 
 # Profiler reports
 *.ncu-rep

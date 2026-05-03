@@ -61,6 +61,8 @@ class VariantSpec:
 # Order matters for output ergonomics (groups by variant in the Parquet).
 VARIANT_REGISTRY: list[VariantSpec] = [
     VariantSpec("sdpa",         None,              None,                       False),
+    VariantSpec("sdpa_cudnn",   None,              None,                       False),
+    VariantSpec("sdpa_flash",   None,              None,                       False),
     VariantSpec("v0_naive_pt",  "v0_naive_fp32",   "attention_naive_pt",       False),
     VariantSpec("v0_naive_cu",  "v0_naive_fp32",   "attention_naive_cu",       True),
     VariantSpec("v1_tiled_cu",  "v1_tiled_fp16",   "attention_tiled_cu",       True),
@@ -74,12 +76,57 @@ def _sdpa(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool) -> to
     return F.scaled_dot_product_attention(Q, K, V, is_causal=causal)
 
 
+def _make_pinned_sdpa(backend_name: str):
+    """Build an SDPA wrapper that pins a single dispatch backend.
+
+    `backend_name` is one of {"cudnn", "flash", "efficient", "math"}. We
+    smoke-test the backend with a tiny call before returning the wrapper
+    so an unavailable backend (e.g. flash on a torch build without it) is
+    detected at registration time rather than killing the sweep mid-run.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    backend_map = {
+        "cudnn": SDPBackend.CUDNN_ATTENTION,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+        "math": SDPBackend.MATH,
+    }
+    backend = backend_map[backend_name]
+
+    def _pinned(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, causal: bool) -> torch.Tensor:
+        with sdpa_kernel(backend):
+            return F.scaled_dot_product_attention(Q, K, V, is_causal=causal)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        probe = torch.randn(1, 1, 8, 16, dtype=torch.float16, device=device)
+        with sdpa_kernel(backend):
+            F.scaled_dot_product_attention(probe, probe, probe, is_causal=False)
+
+    return _pinned
+
+
 def _resolve_variant(spec: VariantSpec) -> Callable | None:
     """Return the kernel callable, or ``None`` if it isn't usable.
 
     Logs a warning explaining the skip reason on every failure path.
     """
     if spec.package is None:
+        if spec.name == "sdpa":
+            return _sdpa
+        if spec.name == "sdpa_cudnn":
+            try:
+                return _make_pinned_sdpa("cudnn")
+            except (ImportError, KeyError, AttributeError, RuntimeError) as e:
+                logger.warning("variant sdpa_cudnn: backend unavailable (%s) -- skipping", e)
+                return None
+        if spec.name == "sdpa_flash":
+            try:
+                return _make_pinned_sdpa("flash")
+            except (ImportError, KeyError, AttributeError, RuntimeError) as e:
+                logger.warning("variant sdpa_flash: backend unavailable (%s) -- skipping", e)
+                return None
         return _sdpa
     try:
         module = importlib.import_module(spec.package)
@@ -230,6 +277,11 @@ def main() -> int:
             except NotImplementedError as e:
                 # Stub kernels (V1-V4 before their session) raise this.
                 logger.warning("not implemented: %s %s: %s — skipping", name, cfg, e)
+            except RuntimeError as e:
+                # E.g. SDPA pinned to a backend with no available kernel for
+                # this (dtype, head_dim, causal) combination -- log and move on.
+                logger.warning("runtime error: %s %s: %s -- skipping", name, cfg, e)
+                torch.cuda.empty_cache()
             advance()
 
     rows = results_to_rows(results)

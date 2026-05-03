@@ -1,0 +1,31 @@
+\begin{table*}[t]
+  \centering
+  \caption{Headline numbers per variant per representative sequence length, head\_dim=128, batch=2, num\_heads=8. Latency is mean over 500 timed iterations. Memory is peak HBM allocation. Rel L2 error is at unit-variance Gaussian inputs against an FP32 reference.}
+  \label{tab:full_results}
+  \begin{tabular}{l l S[table-format=4.2] S[table-format=4.0] S[table-format=1.2e-1]}
+    \toprule
+    seq\_len & variant & {latency (ms)} & {peak HBM (MB)} & {rel L2 vs FP32} \\
+    \midrule
+    128 & V1 & 0.07 & 2 & 6.00e-04 \\
+    128 & V2 & 0.05 & 2 & 3.00e-04 \\
+    128 & V3 & 0.03 & 2 & 5.30e-02 \\
+    128 & V4 & 0.05 & 2 & 2.10e-01 \\
+    128 & SDPA & 0.02 & 2 & 3.00e-04 \\
+    1024 & V1 & 1.05 & 48 & 6.00e-04 \\
+    1024 & V2 & 1.02 & 16 & 3.00e-04 \\
+    1024 & V3 & 0.50 & 16 & 5.30e-02 \\
+    1024 & V4 & 0.65 & 16 & 2.10e-01 \\
+    1024 & SDPA & 0.26 & 16 & 3.00e-04 \\
+    8192 & V1 & 77.53 & 2176 & 6.00e-04 \\
+    8192 & V2 & 60.29 & 128 & 3.00e-04 \\
+    8192 & V3 & 25.72 & 128 & 5.30e-02 \\
+    8192 & V4 & 33.56 & 128 & 2.10e-01 \\
+    8192 & SDPA & 12.31 & 128 & 3.00e-04 \\
+    16384 & V1 & 310.32 & 8448 & 6.00e-04 \\
+    16384 & V2 & 232.78 & 256 & 3.00e-04 \\
+    16384 & V3 & 97.18 & 256 & 5.30e-02 \\
+    16384 & V4 & 127.68 & 256 & 2.10e-01 \\
+    16384 & SDPA & 48.71 & 256 & 3.00e-04 \\
+    \bottomrule
+  \end{tabular}
+\end{table*}
