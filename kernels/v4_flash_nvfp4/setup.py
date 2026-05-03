@@ -1,12 +1,16 @@
 """AOT build for the V4 NVFP4 (microscaled FP4) fused attention extension.
 
-Stub: implemented in the V4 session, which is exploratory and may degrade to
-a case-study if NVFP4 tooling on consumer Blackwell is too immature for an
-end-to-end attention kernel. Reference: Zhang et al., SageAttention3
-(arXiv 2505.11594) — closest related work, FP4 attention on RTX 5090.
+V4 uses the FP4 mma.sync instruction family (kind::f8f6f4 m16n8k32 with
+e2m1 inputs), which requires the architecture-accelerated target
+``sm_120a`` rather than plain ``sm_120``. ptxas rejects the kind::f8f6f4
+mma instruction when targeting sm_120 and accepts it when targeting
+sm_120a. The 'a' suffix denotes "Architecture-specific accelerated"
+features (per NVIDIA's nvcc docs) and is required on consumer Blackwell
+for the FP4/FP6 narrow-precision MMA family. Reference: Zhang et al.,
+SageAttention3 (arXiv 2505.11594) -- closest related work, FP4 attention
+on RTX 5090.
 
-Boilerplate only — sm_120 explicit, the Windows-only ``-DUSE_CUDA`` macro
-for torch 2.9 + MSVC 14.40+ compatibility.
+Boilerplate aside from the sm_120a flag matches V0..V3.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ ext_modules = [
             "cxx": _CXX_FLAGS,
             "nvcc": [
                 "-O3",
-                "-gencode=arch=compute_120,code=sm_120",
+                "-gencode=arch=compute_120a,code=sm_120a",
                 "--use_fast_math",
                 *_NVCC_EXTRA,
             ],

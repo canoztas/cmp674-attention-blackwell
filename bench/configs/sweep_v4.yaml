@@ -1,0 +1,25 @@
+# V4 sweep config -- FP16 inputs / NVFP4 (E2M1) internal compute, per-row
+# per-K-block (block size 32) microscaling.
+#
+# Same shape grid as sweep_v3.yaml so V0..V4 are directly comparable.
+# Variants run together: sdpa, v1_tiled_cu, v2_flash_cu, v3_flash_cu, v4_flash_cu.
+#
+# Memory budget at b=2, h=8, n=16384, d=128 (FP16 inputs, FP16 outputs):
+#   Q + K + V + O = 4 * (2*8*16384*128*2 bytes) = 256 MB. Fits 16 GiB.
+#
+# warmup/iter: 50/100. Total wall time scales with the slowest variant (V1
+# at long seq_len); V4 should be at least as fast as V3 so doesn't extend
+# the wall.
+
+sweep:
+  name: v4_initial
+  num_warmup: 50
+  num_iter: 100
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048, 4096, 8192, 16384]
+    head_dim: [64, 128]
+    batch_size: [2]
+    num_heads: [8]
+    dtype: ["torch.float16"]
+    causal: [false]

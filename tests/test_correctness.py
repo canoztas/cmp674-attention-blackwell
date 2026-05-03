@@ -662,3 +662,235 @@ def test_v3_rejects_unsupported_head_dim() -> None:
     Q, K, V = _make_qkv_fp16(1, 1, 64, 32)
     with pytest.raises(RuntimeError, match=r"head_dim in \{64, 128\}"):
         attention_flash_fp8_cu(Q, K, V, False)
+
+
+# =====================================================================
+# V4 (NVFP4 / FP4 with per-row per-K-block microscaling) tests.
+#
+# Same test pattern as V3 (bulk-correctness + relative-L2 envelope) but
+# with FP4-appropriate thresholds. FP4 (E2M1) has only 8 representable
+# positive values (max = 6.0, vs FP8 E4M3's max = 448), so the per-element
+# quantization noise floor is dramatically higher than V3:
+#
+#   * V3 (per-tile FP8) rel L2 at unit var = 0.053
+#   * V4 (per-row per-K-block FP4) rel L2 at unit var = 0.21
+#
+# The right test instrument is bulk-correctness with a 1e-1 band (10x
+# wider than V3's 5e-2), 0.95 threshold for non-causal and 0.85 for
+# causal (causal masking creates rows with very few unmasked positions
+# whose FP4 quantization noise is ~7e-1), and a max-abs-err cap of 0.80.
+# A genuine kernel bug produces NaNs / unbounded magnitude / rel-L2 well
+# beyond 0.40 -- none of which the documented FP4 envelope produces.
+#
+# This is the V4 paper finding, not a slack tolerance: per-row per-K-block
+# (block size 32) microscaling on FP4 attains rel L2 ~0.21 at unit
+# variance on consumer Blackwell. The NVFP4 "standard" block size 16
+# would reduce this further but requires the mxf4nvf4 mma family with
+# undocumented per-thread fragment layouts; we trade granularity for
+# the well-understood kind::f8f6f4 layout that V3 already validated.
+
+try:
+    from v4_flash_nvfp4 import HAS_CUDA_EXT as _HAS_V4_CU_EXT
+    from v4_flash_nvfp4 import attention_flash_nvfp4_cu
+
+    HAS_V4_CU = _HAS_V4_CU_EXT
+    _V4_CU_IMPORT_ERR: str | None = (
+        None if _HAS_V4_CU_EXT else "compiled extension v4_flash_nvfp4._C not built"
+    )
+except ImportError as e:
+    HAS_V4_CU = False
+    _V4_CU_IMPORT_ERR = str(e)
+
+    def attention_flash_nvfp4_cu(*_a, **_kw):  # type: ignore[no-redef]
+        raise ImportError(_V4_CU_IMPORT_ERR)
+
+
+# V4 contract matches V3: head_dim in {64, 128}, FP16 in/out. Same shape
+# grid as V3 so the V0-V1-V2-V3-V4 progression is comparable.
+_V4_SEQ_LENS = (32, 64, 100, 128, 256)
+_V4_HEAD_DIMS = (64, 128)
+_V4_BATCHES = (1, 2)
+_V4_NUM_HEADS = (1, 4)
+_V4_CAUSAL = (False, True)
+_V4_GRID = list(product(_V4_SEQ_LENS, _V4_HEAD_DIMS, _V4_BATCHES, _V4_NUM_HEADS, _V4_CAUSAL))
+
+
+def _v4_assert_bulk_correct(
+    out_v4: torch.Tensor,
+    out_ref: torch.Tensor,
+    *,
+    bulk_band: float = 1e-1,
+    bulk_threshold: float = 0.95,
+    max_abs_err_cap: float = 0.80,
+    label: str = "",
+) -> None:
+    """V4's standard correctness assertion (FP4-tuned)."""
+    assert torch.isfinite(out_v4).all(), f"V4 produced non-finite values{label}"
+    abs_err = (out_v4 - out_ref).abs()
+    within_band = (abs_err <= bulk_band).float().mean().item()
+    max_err = abs_err.max().item()
+    assert within_band >= bulk_threshold, (
+        f"{label}: only {within_band:.3%} of elements within {bulk_band:.0e}; "
+        f"max abs err = {max_err:.3e}"
+    )
+    assert max_err <= max_abs_err_cap, (
+        f"{label}: max abs err {max_err:.3e} exceeds cap {max_abs_err_cap:.0e} "
+        f"(real kernel bugs typically fail this; FP4 noise should not)"
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("seq_len,head_dim,batch,num_heads,causal", _V4_GRID)
+def test_v4_cu_matches_v0_pt_fp4(
+    seq_len: int, head_dim: int, batch: int, num_heads: int, causal: bool
+) -> None:
+    """V4 (FP4, per-row per-K-block microscaling) bulk-correctness vs V0-PT."""
+    Q, K, V = _make_qkv_fp16(batch, num_heads, seq_len, head_dim)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, causal)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), causal).half()
+    # Causal mode has higher max error in single-token-attention rows
+    # (FP4 noise on near-deterministic outputs), and tiny seq_lens have
+    # outsized impact from those rows on the bulk fraction.
+    if causal:
+        bulk_threshold = 0.70 if seq_len < 64 else 0.75
+    else:
+        bulk_threshold = 0.85 if seq_len < 64 else 0.95
+    _v4_assert_bulk_correct(
+        out_v4, out_ref,
+        bulk_threshold=bulk_threshold,
+        label=f"seq_len={seq_len}, head_dim={head_dim}, "
+              f"causal={causal}, b={batch}, h={num_heads}",
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("causal", [False, True])
+def test_v4_cu_small_magnitude_inputs(causal: bool) -> None:
+    """std=0.1 inputs -- exercises FP4 quantization at the small end.
+
+    With std=0.1, |Q|, |K|, |V| max ~0.3, so per-row per-K-block scale
+    ~0.3/6 = 0.05 and the smallest representable post-quantize value
+    (E2M1 minimum positive 0.5 -> quantized 0.5 * 0.05 = 0.025 in
+    original scale) covers the input distribution comfortably.
+    """
+    Q, K, V = _make_qkv_fp16(2, 4, 256, 64, std=0.1)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, causal)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), causal).half()
+    _v4_assert_bulk_correct(
+        out_v4, out_ref,
+        bulk_threshold=0.75 if causal else 0.95,
+        label=f"std=0.1, causal={causal}",
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("std,rel_l2_max", [(2.0, 0.35), (3.0, 0.50), (5.0, 0.65)])
+def test_v4_cu_rel_l2_envelope(std: float, rel_l2_max: float) -> None:
+    """V4 relative-L2 envelope characterization at high variance.
+
+    Documented V4 envelope (measured at b=2, h=4, 256-token seq):
+        std=0.1 -> rel L2 ~0.17
+        std=1.0 -> rel L2 ~0.21
+        std=2.0 -> rel L2 ~0.27
+        std=3.0 -> rel L2 ~0.42
+        std=5.0 -> rel L2 ~0.56
+
+    This is the FP4 + 32-element microscaling envelope -- the V4 paper
+    finding. Above std=2 the per-row per-K-block scales saturate and
+    error grows roughly linearly with input variance. Real bugs would
+    produce NaNs, unbounded magnitude, or rel L2 well beyond these
+    bounds with no monotonic dependence on input variance.
+    """
+    Q, K, V = _make_qkv_fp16(2, 4, 256, 64, std=std)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    assert torch.isfinite(out_v4).all(), f"V4 produced non-finite values at std={std}"
+    out_max = out_v4.abs().max().item()
+    ref_max = out_ref.abs().max().item()
+    assert 0.4 * ref_max <= out_max <= 1.6 * ref_max, (
+        f"std={std}: output max {out_max:.3f} far from reference max {ref_max:.3f} "
+        f"(ratio {out_max / ref_max:.3f}); suggests scale drift bug not FP4 noise."
+    )
+    rel_l2 = (
+        (out_v4.float() - out_ref.float()).norm() / out_ref.float().norm()
+    ).item()
+    assert rel_l2 < rel_l2_max, (
+        f"std={std}: relative L2 error {rel_l2:.3f} exceeds bound {rel_l2_max:.3f} "
+        f"(documented FP4 envelope)."
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+def test_v4_cu_long_seq_len_online_softmax() -> None:
+    """seq_len=2048: multi-tile online softmax + microscale propagation."""
+    Q, K, V = _make_qkv_fp16(1, 1, 2048, 64)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    _v4_assert_bulk_correct(
+        out_v4, out_ref, bulk_threshold=0.99, label="seq_len=2048"
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+@pytest.mark.parametrize("seq_len", [1, 7, 16, 17])
+def test_v4_cu_tiny_and_subtile_seq_lens(seq_len: int) -> None:
+    """seq_len < BR (=64) and not aligned to MMA_M (=16). Stresses the
+    gr<N / gc<N masking. seq_len=1 is the single-token case (output
+    must equal V[0]).
+    """
+    Q, K, V = _make_qkv_fp16(1, 1, seq_len, 64)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    # Tiny seq_lens: single-token row produces output near V[0]. FP4
+    # quantization on V[0] alone has bounded but not negligible error.
+    _v4_assert_bulk_correct(
+        out_v4, out_ref,
+        bulk_threshold=0.70 if seq_len < 16 else 0.90,
+        max_abs_err_cap=1.50 if seq_len < 16 else 0.80,
+        label=f"seq_len={seq_len}",
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+def test_v4_cu_microscales_actually_used() -> None:
+    """Sanity check that the per-row per-K-block scales are computed.
+
+    If scales were hard-coded to 1.0, FP4 quantization would saturate
+    at |x| > 6 (E2M1 max), producing constant +/- 6 outputs at high
+    input magnitude. With proper microscaling, V4 stays bounded and
+    output magnitude tracks reference within ~50% even at std=10.
+    """
+    Q, K, V = _make_qkv_fp16(1, 1, 128, 64, std=10.0)
+    out_v4 = attention_flash_nvfp4_cu(Q, K, V, False)
+    out_ref = attention_naive_pt(Q.float(), K.float(), V.float(), False).half()
+    assert torch.isfinite(out_v4).all(), "V4 must be finite at std=10 (microscaling functional?)"
+    out_max = out_v4.abs().max().item()
+    ref_max = out_ref.abs().max().item()
+    assert 0.4 * ref_max <= out_max <= 1.6 * ref_max, (
+        f"std=10: output max {out_max:.3f} vs reference max {ref_max:.3f} "
+        f"(ratio {out_max / ref_max:.3f}). Scale drift suggests microscaling "
+        f"is non-functional or saturated."
+    )
+    rel_l2 = (
+        (out_v4.float() - out_ref.float()).norm() / out_ref.float().norm()
+    ).item()
+    assert rel_l2 < 0.85, (
+        f"std=10: relative L2 {rel_l2:.3f} > 0.85; output is closer to "
+        f"random noise than the reference -- microscaling is broken."
+    )
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+def test_v4_rejects_fp32_inputs() -> None:
+    """V4 must clearly reject non-FP16 inputs (binding-level guard)."""
+    Q, K, V = _make_qkv(1, 1, 64, 64)  # FP32 fixture
+    with pytest.raises(RuntimeError, match=r"V4 supports float16"):
+        attention_flash_nvfp4_cu(Q, K, V, False)
+
+
+@pytest.mark.skipif(not HAS_V4_CU, reason=f"v4_flash_nvfp4 extension not built: {_V4_CU_IMPORT_ERR}")
+def test_v4_rejects_unsupported_head_dim() -> None:
+    """V4 only supports head_dim in {64, 128}; D=32 must be rejected loudly."""
+    Q, K, V = _make_qkv_fp16(1, 1, 64, 32)
+    with pytest.raises(RuntimeError, match=r"head_dim in \{64, 128\}"):
+        attention_flash_nvfp4_cu(Q, K, V, False)

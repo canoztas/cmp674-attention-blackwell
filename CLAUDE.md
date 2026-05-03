@@ -45,18 +45,24 @@ runtime deps are not declared there.
 | V1  | FP16        | Tiled, Tensor Core (hand-rolled WMMA), still materializes outputs     | **Done**    |
 | V2  | FP16        | Fused + online softmax (FlashAttention-style)                         | **Done**    |
 | V3  | FP8 (E4M3)  | V2 + per-tile scaling, hand-rolled `mma.sync.m16n8k32` PTX            | **Done**    |
-| V4  | FP4 (NVFP4) | V3 + microscaling (Blackwell-only, exploratory)                       | Pending     |
+| V4  | FP4 (NVFP4) | V3 + per-row per-K-block (block size 32) software microscaling        | **Done**    |
 
 **One variant per session.** V0 was the correctness baseline + worst case.
 V1 isolates the contribution of *tiling + Tensor Cores* before V2 adds
 fusion. V1 went WMMA over CUTLASS for didactic clarity and zero install
 risk; V2 stayed WMMA because the `CollectiveEpilogue` payoff didn't justify
-the install + sm_120 verification cost mid-session. V3 (this session)
-re-litigated CUTLASS once more and went hand-rolled inline PTX
-(`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`) because CUTLASS
-v4.4.2 has no FMHA reference for sm_120a — the `77_blackwell_fmha` example
-is sm_100a/103a only (datacenter Blackwell, requires TMA which sm_120
-lacks). See "Lessons from V3 session" for the full call.
+the install + sm_120 verification cost mid-session. V3 went hand-rolled
+inline PTX (`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`) because
+CUTLASS v4.4.2 has no FMHA reference for sm_120a -- the `77_blackwell_fmha`
+example is sm_100a/103a only (datacenter Blackwell, requires TMA which
+sm_120 lacks). V4 (this session) extends V3's structure to FP4 (E2M1)
+with software microscaling (per-row per-K-block, block size 32),
+using `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32`.
+The hardware NVFP4 mma family (`mxf4nvf4.m16n8k64`) was rejected because
+its per-thread fragment layout uses CuTe-style scattered-V mappings that
+require ldmatrix-style swizzled SMEM, breaking V3's row-major-SMEM-with-
+direct-b32-reads idiom. Block size 32 is a defensible perf/granularity
+tradeoff vs the NVFP4-standard 16. See "Lessons from V4 session".
 
 ## Build / test / benchmark commands
 
@@ -83,8 +89,9 @@ pip install --no-build-isolation -e kernels/v0_naive_fp32
 pip install --no-build-isolation -e kernels/v1_tiled_fp16
 pip install --no-build-isolation -e kernels/v2_flash_fp16
 pip install --no-build-isolation -e kernels/v3_flash_fp8
+pip install --no-build-isolation -e kernels/v4_flash_nvfp4   # builds for sm_120a (NOT plain sm_120)
 
-# Run all tests (402 expected)
+# Run all tests (495 expected)
 pytest
 
 # Run a single variant's correctness tests
@@ -108,18 +115,28 @@ python bench/run_all.py --variants sdpa v1_tiled_cu v2_flash_cu v3_flash_cu `
     --config bench/configs/sweep_v3.yaml `
     --output bench/results/v3_initial.parquet
 
+# Run V4 sweep (FP4 vs FP8 vs FP16, V1 + V2 + V3 + V4 + SDPA, full grid)
+python bench/run_all.py --variants sdpa v1_tiled_cu v2_flash_cu v3_flash_cu v4_flash_cu `
+    --config bench/configs/sweep_v4.yaml `
+    --output bench/results/v4_initial.parquet
+
 # Generate figures
 python analysis/plot_v0_initial.py
 python analysis/plot_v1_vs_v0.py
 python analysis/plot_v2_vs_v1_v0.py
 python analysis/plot_v3_vs_v2_v1.py
+python analysis/plot_v4_vs_v3_v2_v1.py
 python analysis/plot_full_pareto.py
+python analysis/plot_full_pareto_final.py   # paper headline 2-panel figure
 
 # Verify FP16 Tensor Core engagement (V1, V2)
 cuobjdump --dump-sass kernels/v2_flash_fp16/_C.cp311-win_amd64.pyd | Select-String HMMA
 
 # Verify FP8 Tensor Core engagement (V3) -- mnemonic is QMMA on sm_120 SASS
 cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-String QMMA
+
+# Verify FP4 Tensor Core engagement (V4) -- mnemonic is QMMA.16832.F32.E2M1.E2M1
+cuobjdump --dump-sass kernels/v4_flash_nvfp4/_C.cp311-win_amd64.pyd | Select-String QMMA
 ```
 
 ## Repository layout
@@ -130,15 +147,18 @@ cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-Strin
   helper: vcvars64.bat + `CUDA_HOME` + Nsight Compute on PATH + conda `gpu` activation.
   Dot-source it in shells where the user's `gpu` profile function isn't available.
 - `kernels/v{0..4}_<name>/` — one directory per variant. Each has its own `setup.py`
-  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. V0, V1, V2, and V3
-  are implemented; V4 is a skeleton (compilable stub that raises at runtime) so
-  the next session skips the boilerplate. Variant directories: `v0_naive_fp32`,
+  using `torch.utils.cpp_extension.CUDAExtension` for AOT build. All five (V0..V4)
+  are implemented and tested. Variant directories: `v0_naive_fp32`,
   `v1_tiled_fp16`, `v2_flash_fp16`, `v3_flash_fp8`, `v4_flash_nvfp4`.
+  V4 is the only variant whose setup.py targets `sm_120a` (architecture-
+  accelerated) instead of plain `sm_120` -- the FP4 mma instruction family
+  (`kind::f8f6f4`) requires the `a` suffix.
 - [external/cutlass/](external/cutlass/) — git submodule pinned at v4.4.2. Used as
   a reference for the FP8 PTX inline asm pattern (`cute::SM89_16x8x32_F32E4M3E4M3_TN`)
-  in V3 and as the planned starting point for V4 (NVFP4) where the
-  `examples/79_blackwell_geforce_gemm` series has sm_120a-supported building blocks.
-  V3 does **not** link CUTLASS at build time — the submodule is reference-only.
+  in V3 and as the FP4 PTX reference (`cute::SM120_16x8x32_TN<float_e2m1_t,
+  float_e2m1_t, float>` and the kind::f8f6f4 mma family in
+  `cute/arch/mma_sm120.hpp`) for V4. Neither V3 nor V4 link CUTLASS at
+  build time -- the submodule is reference-only.
 - [bench/harness.py](bench/harness.py) — core benchmarking machinery (CUDA event timing, p50/p95/p99,
   forward-compatible Parquet schema all variants share).
 - [bench/run_v0.py](bench/run_v0.py) — V0 paper-experiment driver (V0-PT, V0-CU, SDPA over
@@ -150,7 +170,8 @@ cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-Strin
   `sweep_v1.yaml` is the FP16 twin used by V1 (same shape grid, different dtype);
   `sweep_v2.yaml` extends to seq_len=8192 with smaller (B, H) for V2's long-seq story;
   `sweep_v3.yaml` extends further to seq_len=16384 (FP8 inputs halve the per-tile SMEM
-  footprint, opening room for the long-seq story without OOM).
+  footprint); `sweep_v4.yaml` is the V4 sweep (same grid as v3, runs all five
+  variants + SDPA across seq_len 128..16384).
 - `bench/results/` — Parquet output (gitignored except `.gitkeep`).
 - [tests/test_correctness.py](tests/test_correctness.py) — every kernel ships with a passing correctness test
   against the PyTorch reference. **A kernel without a passing test does not get committed.**
@@ -165,6 +186,9 @@ cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-Strin
 - **CUDA:** kernel filenames `<variant>_<purpose>.cu`. Each `setup.py` always targets
   sm_120 explicitly via `'-gencode=arch=compute_120,code=sm_120'` rather than relying on
   `TORCH_CUDA_ARCH_LIST`. Builds must fail loudly if the wrong arch slips in.
+  **Exception:** V4 targets `sm_120a` (architecture-accelerated variant) because
+  the `kind::f8f6f4` FP4 mma instruction family is rejected by ptxas on plain
+  sm_120 ("Feature '.kind::f8f6f4' not supported on .target 'sm_120'").
 - **Reproducibility:** every benchmark output records driver version, torch version,
   CUDA version, GPU model, timestamp, and git commit hash.
 - **Determinism where possible:** fix random seeds for input tensors. Document where
@@ -175,15 +199,23 @@ cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-Strin
 - **Consumer Blackwell tooling immaturity (2026):** CUTLASS / Transformer Engine /
   FlashInfer support for sm_120 is still landing. Toolchain validation is the highest-
   priority de-risking step every session — do not skip it.
-- **V4 (NVFP4) may degrade to a case-study** if NVFP4 tooling is too immature to run
-  end-to-end attention. Acceptable for the paper; degrade rather than block.
+- **V4 (NVFP4) tooling immaturity DID bite** -- the hardware NVFP4 mma family
+  (`mxf4nvf4.m16n8k64`) has CuTe-style scattered-V per-thread fragment layouts
+  that don't map to row-major SMEM with direct b32 reads. V4 went software
+  microscaling on top of `kind::f8f6f4.m16n8k32.e2m1.e2m1` instead. Documented
+  in V4 lessons; the paper finding is honest about the resulting overhead.
 - **Windows + CUDA extension builds** can be brittle; always surface exact `nvcc` errors
   rather than silently retrying.
 
 ## Deferred work (do NOT do until the relevant variant session)
 
-- V4 implementation.
-- V0 / V1 / V2 / V3 optimization. V0 is intentionally slow and obvious;
+- Hardware NVFP4 mma (`mxf4nvf4.m16n8k64` block-scaled). V4 chose software
+  microscaling on `kind::f8f6f4.m16n8k32` because the hardware path's
+  per-thread fragment layout uses CuTe scattered V indexing that requires
+  ldmatrix/ldsm-style swizzled SMEM. Lifting V4 onto the hardware mma
+  would close the V4-vs-V3 perf gap and potentially beat SDPA at long
+  seq_len; estimate: 1-2 sessions of work. Out of scope for the paper.
+- V0 / V1 / V2 / V3 / V4 optimization. V0 is intentionally slow and obvious;
   V1 picks defensible tile defaults (BR=BC=BD=64); V2 keeps O accumulator
   in SMEM (V2 lessons); V3 moves O to register fragments but keeps Q, K, V,
   P in SMEM (no `ldmatrix` acceleration, no warp-specialized pipelining).
@@ -194,9 +226,9 @@ cuobjdump --dump-sass kernels/v3_flash_fp8/_C.cp311-win_amd64.pyd | Select-Strin
 - Re-running V0 / V1 at the V2 sweep grid (seq_len up to 8192) for full Pareto
   curves. Current snapshots are at separate (B, H) for memory headroom.
 - CI / GitHub Actions.
-- CUTLASS, Transformer Engine, FlashInfer installs. Reconsider CUTLASS at
-  V3 (FP8 epilogue scaling makes the install cost worthwhile; see V2 lessons).
-- Paper text. `paper/` stays empty until V3+.
+- CUTLASS, Transformer Engine, FlashInfer installs. CUTLASS submodule was
+  added at V3 as reference-only; V4 also keeps it reference-only.
+- Paper text. `paper/` is the next session's work.
 
 ## Reference papers (cite, don't re-read each session)
 
@@ -569,100 +601,222 @@ the code alone.
   I/O). V3 hits ~50% of SDPA throughput while introducing a real new
   capability (FP8 attention with documented accuracy degradation).
 
-## V4 feasibility assessment
+## Lessons from V4 session
 
-**V4 (NVFP4) is feasible as a real kernel, not a case-study.** Three signals
-support this:
+Captured before paper writing. Each item is a real time-cost issue not
+derivable from the code alone.
 
-1. **CUTLASS has explicit sm_120a NVFP4 GEMM examples** in `external/cutlass/
-   examples/79_blackwell_geforce_gemm/`: `79a_blackwell_geforce_nvfp4_bf16_gemm.cu`,
-   `79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu`, `79d_blackwell_geforce_nvfp4_grouped_gemm.cu`.
-   These are sm_120a-gated and ship with CUTLASS 4.4.2; they should compile
-   and run on RTX 5080 today.
-2. **NVFP4 is hardware-native on consumer Blackwell** (per the V3 architecture
-   review of CUTLASS examples) -- it's the headline new precision for
-   sm_120, more so than FP8 (which is shared with Ada/Hopper). The
-   precedent for narrow-precision attention on consumer Blackwell
-   exists in SageAttention3 (arXiv 2505.11594, RTX 5090 NVFP4 attention).
-3. **The hand-rolled FP8 path V3 took transfers cleanly.** V3's design
-   (cooperative absmax + quantize, register-resident O, online softmax in
-   FP32, per-tile scaling, transpose-on-load V, inline-PTX mma.sync) lifts
-   to NVFP4 with the differences being (a) microscaling block size
-   (NVFP4 is per-16-element block scales, hardware-managed via the SF
-   tensor) and (b) the mma instruction (`tcgen05.mma` family or the
-   sm_120a-specific narrow-precision sync mma -- to be verified against
-   PTX ISA at V4 kickoff).
+- **The hardware NVFP4 mma family (`mxf4nvf4.m16n8k64`) is hostile to
+  hand-rolled SMEM access.** CUTLASS's `mma_traits_sm120.hpp` ALayout for
+  the K=64 NVFP4 mma reads (decoded):
+    A: (T32,V32)->(M16,K64), per-thread b32 register holds 8 FP4 values
+       at SCATTERED (m, k) positions (e.g. for thread 0, b32 #0 holds
+       (0,0), (0,16), (0,32), (0,48), (1,0), (1,16), (1,32), (1,48)).
+  This scattered layout assumes a cute-style ldmatrix or swizzled SMEM
+  load -- it does NOT correspond to 8 consecutive bytes from a row-major
+  SMEM tensor. V3's `*reinterpret_cast<uint32_t*>(&Q_smem[r*D + c])`
+  pattern that worked for `m16n8k32` FP8 does NOT work for NVFP4
+  `m16n8k64`. Implementing it requires either a CUTLASS-mediated
+  ld.matrix or a custom swizzled SMEM layout. Either is multi-day work
+  and fragile to verify.
+- **Decision for V4: software microscaling on `kind::f8f6f4.m16n8k32`.**
+  This instruction family takes FP4 inputs in the same per-thread
+  fragment layout as V3's FP8 mma (4 b32 / thread for A, 2 for B,
+  4 floats accumulator) -- because the f8f6f4 family REUSES the FP8
+  register format, with FP4 occupying the MIDDLE 4 bits of each 8-bit
+  byte container (`0b00ABCD00`). CUTLASS's `mma_traits_sm120.hpp`
+  comments at lines 211-225 document the required `<<2` shift after
+  conversion. CUDA's `__nv_cvt_float_to_fp4(.., __NV_E2M1, cudaRoundNearest)`
+  returns the FP4 in the LOW 4 bits; we shift left by 2 in
+  `f32_to_e2m1_middle()`. Block scaling becomes software: per-(row,
+  K-block 32 elements) FP32 scales for Q, K, V, P, applied as a single
+  multiply on the FP32 accumulator at the end of each mma call.
+- **FP4 mma requires `sm_120a`, not plain `sm_120`.** ptxas rejects
+  `kind::f8f6f4` on `sm_120` with: "Feature '.kind::f8f6f4' not supported
+  on .target 'sm_120'". The 'a' suffix denotes architecture-accelerated
+  features. V4 is the only variant whose setup.py uses
+  `'-gencode=arch=compute_120a,code=sm_120a'`. Verify in CUTLASS's
+  `cute/arch/config.hpp` lines 153-170 -- `CUTE_ARCH_F8F6F4_MMA_ENABLED`
+  is set when SM120A_ENABLED is defined and CUDA >= 12.8.
+- **The SASS mnemonic for FP4 sync mma on sm_120a is `QMMA.16832.F32.E2M1.E2M1`.**
+  Same QMMA mnemonic family as V3 (V3 = `QMMA.16832.F32.E4M3.E4M3`); the
+  precision is encoded in the suffix. V4 emits 96 QMMA instructions across
+  the two HEAD_DIM template instantiations -- exactly the same count as
+  V3, because the same mma is called the same number of times (the K=32
+  per-mma stays the same; only the precision changes).
+- **Per-row per-K-block microscaling needs per-warp shfl reductions, not
+  block-wide.** V3's load pattern (idx = tid + i*128) gives each thread
+  one column for many rows at D=128. Threads with the same warp_id cover
+  the same K-block (since warps map to col-strides of 32 = KBLOCK). So
+  per-(row, kb) absmax = warp shfl across 32 lanes for one row, repeated
+  BR times per warp. No cross-warp comm needed for Q or K. Each warp
+  emits BR (=64) per-row absmax results.
+- **V's load pattern needs to differ from Q/K** to avoid cross-warp
+  reductions for per-(d, kb_n) absmax. New V pattern: thread tid handles
+  ONE d-position for a contiguous range of n-values. At D=128, each
+  thread covers d=tid for all 64 n's and computes 2 scales (kb_n=0,1)
+  via single-thread register reductions. At D=64, two threads per d
+  each cover one (d, kb_n). No cross-thread reduction either way.
+- **Microscaling has measurable per-mma overhead.** Each mma call now
+  does: 4 SMEM loads for B-scales (one per col of the m16n8 output),
+  4 register multiplies (sa[row] * sb[col]), 4 register adds. That's
+  ~12 extra ops per mma. Across 96 mma calls per (kv iter, thread)
+  this is ~1100 ops/thread/iter overhead. V3's per-tile dequant was
+  ~256 ops/thread/iter. Net microscaling overhead: ~4x V3's dequant cost.
+  Combined with the more expensive cooperative load (per-warp
+  reductions vs single block reduce), V4 ends up ~30% slower than V3.
+- **The result: V4 is 1.3x SLOWER than V3, not faster.** Measured at
+  HEAD_DIM=128, b=2, h=8, seq_len=8192: V4 = 33.4 ms vs V3 = 25.8 ms.
+  At seq_len=16384: V4 = 126.6 ms vs V3 = 96.5 ms. The FP4 hardware
+  throughput advantage on Blackwell 5th-gen Tensor Cores (theoretical 2x
+  FP8) is more than canceled by software microscaling overhead. **This is
+  the V4 paper finding the kickoff prompt explicitly anticipated:**
+  "FP4 doesn't always win on consumer Blackwell because microscaling
+  overhead." With the hardware mxf4nvf4.m16n8k64 instruction (which
+  internalizes the per-16-element microscaling), the calculus would
+  flip -- but that requires the scattered-fragment ldmatrix pattern
+  (deferred work).
+- **Accuracy is honest.** V4 rel L2 vs FP32 reference at unit variance:
+  0.21 (vs V3's 0.053, V2's 3e-4). Across input variance:
+    std=0.1 -> 0.17
+    std=1.0 -> 0.21
+    std=2.0 -> 0.27
+    std=3.0 -> 0.42
+    std=5.0 -> 0.56
+  Roughly linear in std above unit variance, like V3. The "contrast-
+  dependent error floor" V3 documented is ~4x larger for FP4 because
+  E2M1 has 6 representable positive values vs E4M3's 16.
+- **Causal mode produces wider max-abs-err than non-causal** for V4.
+  Reason: rows with very few unmasked tokens (e.g. row 0 attends only
+  to itself, row 1 to 2 tokens) have near-deterministic outputs that
+  FP4 quantization noise hits proportionally harder. Bulk-correctness
+  test thresholds set at 0.95 non-causal / 0.75 causal at the 1e-1
+  band. Real bugs would fail finiteness, output-magnitude bounding,
+  or rel L2 well beyond the documented envelope.
+- **Editable install warning persists.** Same as V3 lessons: the V4
+  wheel logs a tiny size (~3 KB) but the actual `_C.cp311-win_amd64.pyd`
+  ends up in `kernels/v4_flash_nvfp4/_C.cp311-win_amd64.pyd` (~540 KB).
+  Trust the .pyd size, not the wheel size.
+- **Per-row P scaling fixes one of V3's known accuracy holes.** V3's
+  per-tile P scale couldn't handle high-contrast rows; V4 has per-row
+  per-K-block scales for P, which is the V3 lessons' "V3.5 / V4 design
+  lever." But the FP4 dynamic range narrowness more than counteracts the
+  per-row gain at unit variance, so V4 ends up worse than V3 on
+  per-element accuracy. The per-row scaling does pay off on output
+  magnitude tracking (V4 stays within 50% of reference output max
+  even at std=10, vs V3 occasionally drifting).
 
-The risk in V4 isn't whether the kernel can be built; it's whether the
-*accuracy degradation* is bounded enough to be a useful Pareto point. V3
-already shows that rel_l2 grows linearly with input variance for per-tile
-FP8; FP4 with ~2 bits of mantissa will be markedly worse, and per-tile
-scaling will not be sufficient -- microscaling (per-16-element block
-scales) is the standard recipe. V4's first paper finding will likely be
-"NVFP4 attention requires microscaling, not per-tile, to stay useful at
-unit-variance inputs." That's the right paper finding regardless of which
-direction the numbers go.
+## Paper readiness assessment
+
+After V0-V4, the paper's contribution and findings are clear:
+
+**Contribution:** The first systematic Pareto study of mixed-precision
+attention on consumer Blackwell (RTX 5080, sm_120a). Five hand-rolled
+kernels spanning FP32 -> FP4, all using the same algorithmic skeleton
+(online softmax, fused single kernel, register-resident O for the
+narrow-precision variants), with per-precision quantization strategies
+documented and benchmarked end-to-end. The repository is reproducible
+on a single consumer GPU; all results pass automated correctness tests
+against an FP32 reference.
+
+**Flagship finding:** Per-tile FP8 (V3) is the practical sweet spot on
+consumer Blackwell -- 2.4x faster than FP16 fused (V2), 8x less HBM
+peak memory than tiled FP16 (V1), and rel L2 of 0.05 vs FP32 reference.
+FP4 (V4) hardware throughput advantage is real but software microscaling
+overhead more than cancels it; V4 is 30% slower than V3 with 4x worse
+rel L2.
+
+**Secondary findings:**
+1. The V1->V2 transition (adding online softmax / kernel fusion) is
+   the largest memory win in the sweep: 17x reduction at seq_len=8192.
+   FlashAttention's algorithmic insight transfers cleanly to sm_120a.
+2. Tensor Core engagement on consumer Blackwell is verifiable via
+   `cuobjdump --dump-sass | Select-String QMMA` -- bypasses Nsight
+   Compute's ERR_NVGPUCTRPERM admin requirement.
+3. CUTLASS's sm_120a FP4 mma family (`mxf4nvf4.m16n8k64`) uses CuTe-
+   style scattered V layouts incompatible with row-major SMEM + direct
+   b32 reads. Software microscaling on `kind::f8f6f4.m16n8k32` is the
+   ergonomic alternative for hand-rolled kernels but pays a measurable
+   per-mma overhead.
+4. The accuracy/precision Pareto: every halving of the mantissa width
+   widens rel L2 by ~3-5x (V2: 3e-4, V3: 5e-2, V4: 0.21).
+
+**Limitations to acknowledge:**
+- Single GPU (RTX 5080). Findings about per-tile vs microscaling
+  may differ on datacenter Blackwell (sm_100a/sm_103a) which has TMA
+  and the mxf4nvf4 instruction available with documented ldmatrix
+  patterns via CUTLASS's CollectiveBuilder.
+- V4's choice of block size 32 (vs NVFP4-standard 16) was forced by
+  the kind::f8f6f4 K-dim. Block size 16 would require the mxf4nvf4
+  family and is left as future work.
+- Forward pass only. Backward pass is non-trivial for the narrow-
+  precision variants and out of scope for the paper.
 
 ## Current status
 
-**Session 3 — V0 + V1 + V2 + V3 implemented; V4 still a stub.** 402 pytest
-tests pass: 147 V0 (unchanged) + 70 V1 (unchanged) + 92 V2 (unchanged) +
-92 V3 + 1 harness. V3-CU (`kernels/v3_flash_fp8/`) builds for sm_120 via
-`pip install -e`; 96 QMMA (FP8 E4M3 sync mma) instructions across the two
-HEAD_DIM template instantiations (32 for `<64>`, 64 for `<128>`).
+**Session 4 -- V0 + V1 + V2 + V3 + V4 ALL implemented.** 495 pytest tests
+pass: 147 V0 + 70 V1 + 92 V2 + 92 V3 + 93 V4 + 1 harness. V4-CU
+(`kernels/v4_flash_nvfp4/`) builds for `sm_120a` via `pip install -e`;
+96 QMMA.16832.F32.E2M1.E2M1 (FP4 sync mma) instructions across the two
+HEAD_DIM template instantiations (same count as V3, since the per-tile
+mma call structure is preserved -- only the precision changes).
 
-V3 algorithmic state: same online-softmax + single-kernel-fusion as V2,
-plus FP8 (E4M3) Q, K, V, P with one FP32 scale per tile (Q tile = BR×D,
-K/V tile = BC×D, P tile = BR×BC). FP16 inputs to the binding, FP16 outputs
-(matches V0/V1/V2 contract); quantization performed in-kernel. **O
-accumulator now register-resident** in per-warp `o_frag[FRAG_N_PV][4]`
-fragments -- per-iteration alpha rescale is `o_frag *= alpha[row]` in
-registers, not via SMEM round-trip (V2's main perf wall). Templated by
-HEAD_DIM ∈ {64, 128}. mma.sync inline PTX
-(`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`) following CUTLASS's
-`SM89_16x8x32_F32E4M3E4M3F32_TN` pattern.
+V4 algorithmic state: same online-softmax + single-kernel-fusion + V3's
+register-resident O + V transposed col-major in SMEM. New: FP4 (E2M1)
+Q, K, V, P with **per-row, per-K-block (block size 32) FP32 microscales**
+applied as software multiplies on the FP32 accumulator at each mma call.
+FP16 in/out matches V0..V3 contract; quantization performed in-kernel.
+Uses `mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e2m1.f32`
+with FP4 in middle bits (CUDA cvt + `<<2` shift).
 
-CUTLASS submodule installed at `external/cutlass/` pinned at v4.4.2 for
-reference (V3 doesn't link it; V4 will).
+Hardware NVFP4 mma (`mxf4nvf4.m16n8k64`) NOT used because its CuTe-style
+per-thread fragment layout requires ldmatrix-style swizzled SMEM that
+breaks V3's row-major-SMEM-with-direct-b32-reads idiom; lifting V4 onto
+it is documented as deferred work. CUTLASS submodule still reference-only
+(neither V3 nor V4 link it).
 
-Sweep at `bench/results/v3_initial.parquet` (5600 rows: 56 (variant, config)
-pairs × 100 iterations of V1 + V2 + V3 + SDPA on FP16 across
-seq_len ∈ {128…16384}, head_dim ∈ {64, 128}, b=2, h=8). Figures at
-`analysis/figures/v3_vs_v2_v1.png` and `analysis/figures/full_pareto.png`
-(the latter is the first version of the paper's headline figure: latency
-vs accuracy across the four variants + SDPA).
+Sweep at `bench/results/v4_initial.parquet` (7000 rows: 70 (variant, config)
+pairs * 100 iterations of V1 + V2 + V3 + V4 + SDPA on FP16 across
+seq_len in {128..16384}, head_dim in {64, 128}, b=2, h=8). Figures at
+`analysis/figures/v4_vs_v3_v2_v1.png`, `analysis/figures/full_pareto.png`
+(updated to include V4), and `analysis/figures/full_pareto_final.png`
+(the paper's headline 2-panel figure at seq_len=8192 and 16384).
 
-Headline numbers at seq_len=8192, head_dim=128:
-- Latency: V1 = 80.0 ms, V2 = 59.4 ms, V3 = 25.1 ms, SDPA = 12.8 ms
-  (V3 is 2.37× V2; SDPA is 1.96× V3)
-- Peak memory: V1 = 2176 MB, V2 = V3 = SDPA = 128 MB (V3 matches SDPA exactly)
-- Accuracy (rel L2 vs FP32): V1 = 6e-4, V2 = 3e-4, V3 = 0.053, SDPA = 3e-4
+Headline numbers at seq_len=8192, head_dim=128 (b=2, h=8):
+- Latency: V1=77.1 ms, V2=60.9 ms, V3=25.8 ms, V4=33.4 ms, SDPA=12.3 ms
+  (V3 is 2.36x V2; V4 is 0.77x V3 -- SLOWER, microscaling overhead;
+  SDPA is 2.10x V3 and 2.71x V4)
+- Peak memory: V1=2176 MB, V2=V3=V4=SDPA=128 MB (FP16 in/out contract)
+- Accuracy (rel L2 vs FP32): V1=6e-4, V2=3e-4, V3=0.053, V4=0.21, SDPA=3e-4
 
-V4 directory remains a compilable stub. `bench/run_all.py` resolves
-the registry at startup and runs cleanly across V0 + V1 + V2 + V3 + SDPA
-today, gracefully skipping V4.
+At seq_len=16384, head_dim=128: V1=309 ms, V2=230 ms, V3=96.5 ms,
+V4=126.6 ms, SDPA=48.4 ms. Same ratios.
 
-**Next session — V4 (NVFP4 / FP4).** Microscaling on top of V3's structure.
-First-actions checklist:
+V4's slower-than-V3 result is the **flagship paper finding** -- consumer
+Blackwell FP4 hardware throughput is more than canceled by software
+microscaling overhead at the mma-call granularity. Per the paper-readiness
+section, the hardware mxf4nvf4.m16n8k64 instruction would change this,
+but its scattered-fragment layout requires multi-week scope to implement.
 
-1. `. .\env\activate_for_build.ps1; python env/check_env.py` (10/10 PASS).
-2. `pip install -e kernels/v4_flash_nvfp4` to confirm the stub still builds.
-3. Build and run `external/cutlass/examples/79b_blackwell_geforce_nvfp4_nvfp4_gemm.cu`
-   end-to-end on RTX 5080 to verify NVFP4 GEMM tooling works; this is the
-   V4 install-and-verify gate. If it doesn't build, V4 degrades to a
-   case-study (see "V4 feasibility assessment" above).
-4. Decide: lift V3's hand-rolled inline-PTX path (replacing mma.sync with the
-   sm_120a NVFP4 mma) OR use CUTLASS's CollectiveBuilder for the GEMMs and
-   compose an FMHA -- the second time CUTLASS is the right call because the
-   sm_120a NVFP4 examples are non-trivial (microscaling, SF tensor management)
-   and reimplementing them is wasteful. Recommended: hybrid -- CUTLASS-
-   mediated GEMMs at the cute::Atom level (not the full Collective), softmax
-   + per-row FP8/FP4 quantization stays hand-rolled.
-5. **Microscaling, not per-tile.** NVFP4's per-16-element block scales are
-   the standard recipe (NVIDIA whitepaper, SageAttention3 paper). Per-tile
-   scaling on FP4 would saturate at unit-variance inputs and kill accuracy.
-6. Test envelope: rel L2 < 0.30 at unit variance is a defensible target;
-   below 0.10 would be a strong result. Bulk-correctness is the right
-   instrument; strict assert_close is not.
+**Next session -- paper writing.** Repository is feature-complete; all
+five variants are documented, tested, benchmarked. Suggested session
+structure:
+
+1. Skeleton: IEEE 8-12 page conference paper template in `paper/`.
+2. Sections to draft (in order):
+   - Introduction + contributions
+   - Background (FlashAttention algorithm, Blackwell precisions,
+     mma.sync families on sm_120a)
+   - V0 (FP32 baseline, methodology, per-variant testing)
+   - V1->V2 (tiling -> online softmax + fusion); the memory finding
+     leads here
+   - V3 (FP8 per-tile + register-resident O); the latency finding leads
+   - V4 (FP4 microscaled); the negative perf finding leads HONESTLY
+   - Pareto figure walk-through (full_pareto_final.png is the centerpiece)
+   - Limitations + future work
+3. Figures already generated: `analysis/figures/{v0_initial, v1_vs_v0,
+   v2_vs_v1_v0, v3_vs_v2_v1, v4_vs_v3_v2_v1, full_pareto, full_pareto_final}.png`.
+4. Cite SageAttention3 (closest related work for V4), FlashAttention 1/2/3,
+   FP8 Formats (Micikevicius), and the Blackwell architecture whitepaper.
 
 Update this section at the end of every session.

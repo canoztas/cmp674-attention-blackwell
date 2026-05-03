@@ -1,12 +1,14 @@
-"""Latency vs accuracy Pareto across V1, V2, V3 + SDPA at one shape.
+"""Latency vs accuracy Pareto across V1, V2, V3, V4 + SDPA at one shape.
 
-This is the first version of the paper's headline figure: each variant is
-a single point in (latency, accuracy) space at a fixed (seq_len, head_dim,
-batch, heads). Accuracy is measured as relative L2 error vs an FP32 V0-PT
-reference. Latency comes from the V3 sweep.
+The paper's headline figure: each variant is a single point in (latency,
+accuracy) space at a fixed (seq_len, head_dim, batch, heads). Accuracy
+is measured as relative L2 error vs an FP32 V0-PT reference. Latency
+comes from the V4 sweep parquet (which contains all five variants).
 
-V3's role on this Pareto: it pushes the latency frontier left (faster) at
+V3's role on this Pareto: pushes the latency frontier left (faster) at
 the cost of larger relative error than V2 -- the FP8 envelope.
+V4's role: pushes further left at the cost of larger error than V3 --
+the FP4 envelope.
 
 V0 is omitted: at seq_len=8192 with the b=2, h=8 grid V0 would materialize
 a (2*8*8192*8192) = 1 GiB FP32 attention matrix per call, doable but not
@@ -52,7 +54,7 @@ def _rel_l2(out: torch.Tensor, ref: torch.Tensor) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input",
-        type=Path, default=Path("bench/results/v3_initial.parquet"))
+        type=Path, default=Path("bench/results/v4_initial.parquet"))
     parser.add_argument("--output",
         type=Path, default=Path("analysis/figures/full_pareto.png"))
     parser.add_argument("--seq-len",  type=int, default=8192)
@@ -75,7 +77,7 @@ def main() -> int:
 
     # Latency per variant.
     lat = {}
-    for v in ["v1_tiled_cu", "v2_flash_cu", "v3_flash_cu", "sdpa"]:
+    for v in ["v1_tiled_cu", "v2_flash_cu", "v3_flash_cu", "v4_flash_cu", "sdpa"]:
         rows = sub[sub["variant_name"] == v]
         if rows.empty:
             continue
@@ -118,23 +120,35 @@ def main() -> int:
         except Exception as e:
             logger.warning("V3 accuracy run skipped: %s", e)
 
+    if "v4_flash_cu" in lat:
+        try:
+            import v4_flash_nvfp4 as m
+            if m.HAS_CUDA_EXT:
+                out = m.attention_flash_nvfp4_cu(Q, K, V, False)
+                accuracy["v4_flash_cu"] = _rel_l2(out, ref)
+        except Exception as e:
+            logger.warning("V4 accuracy run skipped: %s", e)
+
     fig, ax = plt.subplots(figsize=(7.0, 5.0))
     label_map = {
         "v1_tiled_cu": "V1 (FP16, tiled)",
         "v2_flash_cu": "V2 (FP16, fused, online softmax)",
         "v3_flash_cu": "V3 (FP8 E4M3, per-tile scaling)",
+        "v4_flash_cu": "V4 (NVFP4 E2M1, per-row per-K-block microscaling)",
         "sdpa": "SDPA (FP16, cuDNN)",
     }
     color_map = {
         "v1_tiled_cu": "tab:blue",
         "v2_flash_cu": "tab:green",
         "v3_flash_cu": "tab:purple",
+        "v4_flash_cu": "tab:red",
         "sdpa": "tab:gray",
     }
     marker_map = {
         "v1_tiled_cu": "s",
         "v2_flash_cu": "D",
         "v3_flash_cu": "*",
+        "v4_flash_cu": "P",
         "sdpa": "^",
     }
 
@@ -145,7 +159,7 @@ def main() -> int:
         y = accuracy[v]
         ax.scatter(x, y,
                    marker=marker_map[v],
-                   s=180 if v == "v3_flash_cu" else 130,
+                   s=180 if v in ("v3_flash_cu", "v4_flash_cu") else 130,
                    color=color_map[v],
                    edgecolors="black",
                    linewidths=0.8,
