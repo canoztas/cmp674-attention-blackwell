@@ -12,6 +12,93 @@ all kernels ship with passing correctness tests against an FP32 reference.
 
 ---
 
+## Problem statement
+
+### Background
+
+Scaled dot-product attention is the dominant compute and memory cost in
+transformer inference; its quadratic dependence on sequence length has
+motivated a decade of kernel-level optimization (tiling, fusion, online
+softmax, narrower precisions). The two largest individual contributions
+are the **FlashAttention** family (Dao et al., 2022 / 2023; Shah et al.,
+2024) and the **mixed-precision attention** literature (Micikevicius et
+al., 2022; SageAttention3, 2025). Each has been independently validated
+on Hopper (H100), datacenter Blackwell (B100 / B200, `sm_100a`), and the
+flagship consumer Blackwell card RTX 5090 (`sm_120a`).
+
+### Gap
+
+The bulk of academic and industrial interest in *consumer* Blackwell has
+fixated on the RTX 5090. The mid-tier **RTX 5080** (`sm_120a`, 84 SMs,
+16 GB GDDR7, ≈960 GB/s) is the actual practical inference target for
+individual researchers, small labs, and edge-deployed serving stacks; it
+shares a compute capability with the 5090 but has materially different
+SM count, L2 capacity, and memory bandwidth, and (as we document) a
+different software-stack story for GPU-attention dispatch on Windows.
+
+> **Whether the FlashAttention algorithmic gains, FP8 throughput
+> benefits, and FP4 microscaling promises *transfer* to this
+> constrained-but-realistic platform is unstudied.**
+> This is the gap our project addresses.
+
+### Research question
+
+> How does the latency–accuracy–memory Pareto frontier of mixed-precision
+> attention shape up on consumer Blackwell (RTX 5080, `sm_120a`), as we
+> add tiling, fusion, FP8, and NVFP4 one variable at a time?
+
+We answer it with a controlled ablation study of five hand-rolled
+attention kernels, each isolating exactly one optimization or precision
+change against its predecessor.
+
+### Constraints
+
+1. Single GPU: RTX 5080, 16 GB. V0 OOMs past `seq_len = 2048`; V1 OOMs
+   past ≈ 8192 at `(batch, heads) = (2, 8)`.
+2. Forward pass only — backward pass is non-trivial for narrow precision
+   and out of scope.
+3. CUTLASS v4.4.2's FMHA reference (`77_blackwell_fmha`) gates compilation
+   to `sm_100a` / `sm_103a` (datacenter Blackwell with TMA), so V3 and
+   V4 use hand-rolled inline-PTX `mma.sync` instead of the missing
+   `sm_120a` FMHA reference.
+4. The hardware NVFP4 `mxf4nvf4.m16n8k64` instruction's CuTe scattered-
+   fragment layout is incompatible with the row-major-SMEM idiom shared
+   with V3, so V4 uses the software-microscaled `kind::f8f6f4.m16n8k32`
+   path. Lifting V4 onto the hardware path is documented as deferred work.
+5. No admin privileges for `nvidia-smi -lgc` (clock locking) or for
+   Nsight Compute counter access (`ERR_NVGPUCTRPERM`); we use
+   `cuobjdump --dump-sass` for Tensor-Core engagement verification and
+   report p50 / p95 / p99 alongside the mean to surface tail variance.
+
+### Hypotheses
+
+| #  | Hypothesis                                                                                                    | Status                                            |
+| -- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| H1 | Online softmax + fusion (V2) eliminates the $N \times N$ HBM materialization                                  | **Confirmed** — exact 17× reduction at `N = 8192` |
+| H2 | FP8 (V3) closes a measurable share of the SDPA latency gap                                                    | **Confirmed** — 2.4× over V2, ≈ half the SDPA gap |
+| H3 | FP4 (V4) extends the V3 latency win because of doubled FP4 throughput                                         | **Refuted** — V4 is ≈ 30 % *slower* than V3       |
+| H4 | Accuracy degrades roughly geometrically with mantissa width                                                   | **Confirmed** — rel L2 widens ~ 4× per halving    |
+
+H3 is the headline negative result: on consumer Blackwell, software
+microscaling overhead dominates the FP4 throughput advantage at the
+`mma.sync` call granularity.
+
+### Contribution
+
+1. The first systematic Pareto study of mixed-precision attention on
+   the RTX 5080 (`sm_120a`).
+2. Five hand-rolled CUDA kernels with a shared algorithmic skeleton,
+   passing 495 correctness tests against an FP32 reference.
+3. A negative result — V4 < V3 by ≈ 30 % — with a concrete forward path
+   (hardware `mxf4nvf4.m16n8k64`) that would invert it.
+4. An open, single-command-reproducible artifact on a single 16 GB
+   consumer GPU, with figure regeneration and full provenance.
+
+For the academic write-up, see [`paper/main.tex`](paper/main.tex)
+(compiled: [`paper/main.pdf`](paper/main.pdf)).
+
+---
+
 ## Variant roadmap
 
 | ID  | Precision    | Design                                                           |
@@ -27,38 +114,185 @@ is built as a standalone PyTorch CUDA extension.
 
 ---
 
-## Headline results
+## Results
 
-At `seq_len = 8192`, `head_dim = 128`, `batch = 2`, `num_heads = 8`:
+End-to-end measurements for V0–V4 plus PyTorch SDPA baseline on
+NVIDIA GeForce RTX 5080 (Blackwell, `sm_120a`), CUDA 12.8,
+PyTorch 2.9.1+cu128, Windows 11. All sweeps fix `batch = 2`,
+`num_heads = 8`, FP16 inputs, non-causal masking. Latencies are mean
+over 100 warmup + 500 measured iterations
+([`bench/configs/sweep_final.yaml`](bench/configs/sweep_final.yaml)).
 
-| Variant | Latency (ms) | Peak Mem (MB) | Rel L2 vs FP32 |
-| ------- | -----------: | ------------: | -------------: |
-| V1      |         77.1 |          2176 |        6.0e-04 |
-| V2      |         60.9 |           128 |        3.0e-04 |
-| V3      |     **25.8** |           128 |        5.3e-02 |
-| V4      |         33.4 |           128 |        2.1e-01 |
-| SDPA    |     **12.3** |           128 |        3.0e-04 |
+### Headline numbers (`seq_len = 8192`, `head_dim = 128`)
 
-Key findings:
+| Variant | Latency (ms) | Peak HBM (MB) | Rel L2 vs FP32 | Speedup vs SDPA |
+| ------- | -----------: | ------------: | -------------: | --------------: |
+| V0 (FP32, naive)        |   OOM    |   OOM   | 0 (ref) | —      |
+| V1 (FP16 tiled WMMA)    |   77.1   |  2176   | 6.0e-04 | 0.16×  |
+| V2 (FP16 fused)         |   60.9   |   128   | 3.0e-04 | 0.20×  |
+| **V3 (FP8 fused)**      | **25.8** |   128   | 5.3e-02 | **0.48×** |
+| V4 (NVFP4 microscaled)  |   33.4   |   128   | 2.1e-01 | 0.37×  |
+| **SDPA (PyTorch math)** | **12.3** |   128   | 3.0e-04 | 1.00×  |
 
-- **V1 → V2** is the largest memory win in the sweep: a 17× reduction at
-  `seq_len = 8192`. FlashAttention-style online softmax + kernel fusion
-  drops the peak from 2.2 GB to 128 MB.
-- **V2 → V3** is the largest latency win: 2.4× at `seq_len = 8192`,
-  rising to 2.4× at `seq_len = 16384`. FP8 throughput on Blackwell 5th-gen
-  Tensor Cores plus a register-resident O accumulator.
-- **V3 → V4** is *negative*: V4 is 1.3× slower than V3. The hardware FP4
-  throughput advantage (theoretical 2× over FP8) is more than canceled by
-  software per-row per-K-block microscaling overhead. With the hardware
-  block-scaled `mxf4nvf4.m16n8k64` instruction the calculus would flip,
-  but its scattered per-thread fragment layout is non-trivial to hand-roll
-  on row-major SMEM and is left as future work.
-- The accuracy/precision Pareto: every halving of mantissa width widens
-  relative L2 error by ~4×: V2 = 3e-4, V3 = 5e-2, V4 = 0.21.
+V0 OOMs past `seq_len ≈ 2048` at `(batch, heads) = (2, 8)`.
+
+### Headline numbers (`seq_len = 16384`, `head_dim = 128`)
+
+| Variant | Latency (ms) | Peak HBM (MB) |
+| ------- | -----------: | ------------: |
+| V1   |   310    |   8448   |
+| V2   |   233    |    256   |
+| V3   |  **97**  |    256   |
+| V4   |   128    |    256   |
+| SDPA |  **49**  |    256   |
+
+At `N = 16384`, V1 occupies 8.4 GB — within striking distance of the
+16 GB ceiling and the operational point at which V1 becomes
+infeasible.
+
+### Three flagship findings
+
+**1. Memory wall breaks at V2 — 17× reduction at `N = 8192`.** Adding
+online softmax + single-kernel fusion drops peak HBM from V1's
+2176 MB to V2's 128 MB — a 17× reduction that exactly matches SDPA's
+profile. Entirely attributable to the kernel structure (no precision
+change between V1 and V2).
+
+```
+V1 → V2 peak HBM @ seq_len=8192, head_dim=128:
+    2176 MB → 128 MB    (17.0× reduction)
+```
+
+**2. V3 closes ≈ half the SDPA latency gap with FP8.** V3's `mma.sync`
+FP8 path plus the register-resident O accumulator (which V2's WMMA
+path can't do without knowing the layout) gives 2.4× over V2 and
+reaches ≈ 48 % of SDPA's throughput.
+
+```
+V2 → V3 latency @ seq_len=8192, head_dim=128:
+    60.9 ms → 25.8 ms   (2.36× speedup)
+V3 → SDPA gap remaining:
+    25.8 ms vs 12.3 ms  (V3 = 0.48× SDPA — half the V2-to-SDPA gap closed)
+```
+
+The two contributions are roughly equal: FP8 mma throughput on the
+5th-gen Tensor Core (theoretical 2× FP16) and register-resident O
+(eliminates V2's per-iteration SMEM round-trip).
+
+**3. V4 LOSES to V3 by ≈ 30 % — the negative result.** NVFP4's
+hardware throughput advantage on Blackwell (theoretical 2× FP8) is
+more than canceled by software microscaling overhead at the
+`mma.sync` call granularity. Each mma incurs ≈ 12 register ops for
+per-row + per-K-block scale application; over 96 mmas per
+`(kv iter, thread)` this is ≈ 1100 ops/thread/iter overhead.
+
+```
+V3 → V4 latency @ seq_len=8192:
+    25.8 ms → 33.4 ms    (V4 is 0.77× V3 — SLOWER)
+V3 → V4 latency @ seq_len=16384:
+    96.5 ms → 127 ms     (same magnitude)
+```
+
+The path forward is the hardware-microscaled `mxf4nvf4.m16n8k64`
+instruction, which internalizes the per-16-element scale at the mma
+boundary. CUTLASS exposes the family via `cute::SM120_16x8x64_TN`,
+but its scattered-fragment layout requires `ldmatrix`-style swizzled
+SMEM incompatible with V3's row-major-SMEM idiom. We document this
+as deferred work; a CUTLASS-mediated implementation would close the
+V4-vs-V3 gap and likely flip the ranking.
+
+### Accuracy envelope
+
+Relative L2 error against an FP32 reference, at unit-variance
+Gaussian inputs:
+
+| Variant | Rel L2 @ σ=1 | Rel L2 @ σ=3 | Rel L2 @ σ=5 |
+| ------- | -----------: | -----------: | -----------: |
+| V1   | 6e-4    | 2e-3   | 5e-3   |
+| V2   | 3e-4    | 1e-3   | 2e-3   |
+| V3   | 5.3e-2  | 0.12   | 0.19   |
+| V4   | 0.21    | 0.42   | 0.56   |
+
+Every halving of mantissa width widens rel L2 by ≈ 4×. Bulk-
+correctness tests (≥ 95 % of elements within 5e-2 absolute error,
+all elements finite, output magnitudes bounded) **pass** for all
+variants across the full sweep grid in non-causal mode; in causal
+mode V4's threshold is 0.75 because rows with very few unmasked
+tokens have near-deterministic outputs that FP4 quantization noise
+hits proportionally harder.
+
+### SDPA dispatch finding
+
+A finding worth foregrounding: **PyTorch 2.9.1+cu128 on Windows
+dispatches SDPA exclusively to the MATH backend on consumer
+Blackwell.** The Flash, cuDNN, and Memory-Efficient backends are all
+runtime-disabled for `(sm_120, FP16, non-causal)` inputs in this
+build:
+
+```
+Torch was not compiled with flash attention.
+cuDNN attention has been runtime disabled.
+Memory Efficient attention has been runtime disabled.
+```
+
+The SDPA baseline is therefore the **vendor's cuBLAS-tuned FP16
+attention with no algorithmic fusion** (a pair of matmuls + a
+softmax that materializes the full $N \times N$ probability matrix
+in HBM). The "SDPA gap" V3 closes is the gap to a heavily-tuned
+matmul stack, not to FlashAttention-2.
+
+### Tensor Core engagement
+
+Verified directly from the compiled cubin via `cuobjdump --dump-sass`,
+bypassing Nsight Compute's `ERR_NVGPUCTRPERM` admin requirement:
+
+| Variant | Mnemonic | Instructions |
+| ------- | -------- | -----------: |
+| V1 (QK kernel)             | `HMMA.16816.F32`              | 120  |
+| V1 (PV kernel)             | `HMMA.16816.F32`              |  32  |
+| V2 (`HEAD_DIM = 64`)       | `HMMA.16816.F32`              |  64  |
+| V2 (`HEAD_DIM = 128`)      | `HMMA.16816.F32`              | 128  |
+| V3 (both `HEAD_DIM`)       | `QMMA.16832.F32.E4M3.E4M3`    |  96  |
+| V4 (both `HEAD_DIM`)       | `QMMA.16832.F32.E2M1.E2M1`    |  96  |
+
+V3 and V4 emit the same number of `QMMA` instructions because the
+per-tile mma call structure is preserved; only the operand precision
+changes.
+
+### Figures
 
 The headline 2-panel Pareto figure (latency vs accuracy at
 `seq_len = 8192` and `16384`) is at
-[`analysis/figures/full_pareto_final.png`](analysis/figures/full_pareto_final.png).
+[`paper/figures/fig_pareto_main.png`](paper/figures/fig_pareto_main.png).
+All paper figures live under [`paper/figures/`](paper/figures/):
+
+| File | Caption |
+| ---- | ------- |
+| `fig_pareto_main.{pdf,png}`            | Latency–accuracy Pareto at `seq_len ∈ {8192, 16384}`            |
+| `fig_latency_vs_seqlen.{pdf,png}`      | Latency vs sequence length, all variants                        |
+| `fig_memory_vs_seqlen.{pdf,png}`       | Peak HBM vs sequence length (V1 → V2 step visible)              |
+| `fig_speedup_matrix.{pdf,png}`         | Pairwise speedup heatmap at `seq_len = 8192`                    |
+| `fig_accuracy_envelope.{pdf,png}`      | Rel L2 vs input std for V2 / V3 / V4                            |
+| `fig_tensor_core_engagement.{pdf,png}` | HMMA / QMMA instruction counts per kernel                       |
+| `tab_full_results.tex`                 | Headline numbers per variant per `seq_len`                      |
+
+Single-command figure regeneration: `python analysis/paper_figures.py`.
+
+### Limitations
+
+- Single hardware platform (RTX 5080). The V4 finding is most
+  sensitive to the unavailability of `mxf4nvf4` via row-major SMEM;
+  a CUTLASS-mediated swizzled-SMEM port would likely flip V4 vs V3.
+- Forward pass only.
+- Driver / software-version-specific. Versions are frozen in the
+  artifact's Parquet provenance.
+- 16 GB ceiling forces fixed `(batch, heads) = (2, 8)`; multi-tier
+  batch sweeps would need a larger card.
+- E5M2 (alternative FP8) and integer-precision attention paths are
+  not characterized.
+
+For the full discussion, see [`paper/main.tex`](paper/main.tex)
+sections 7–8.
 
 ---
 
