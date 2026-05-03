@@ -27,3 +27,7 @@ bench/results/*.parquet
 
 # Notebooks
 .ipynb_checkpoints/
+
+# Claude Code artifacts (kept local, not pushed)
+CLAUDE.md
+.claude/
