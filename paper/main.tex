@@ -94,7 +94,7 @@ bandwidth-memory (HBM) footprint by more than an order of magnitude on
 datacenter GPUs.
 
 The two largest individual contributions to this trajectory are the
-\emph{FlashAttention} family~\cite{dao2022flashattention,dao2023flashattention2,shah2024flashattention3},
+\emph{FlashAttention} family~\cite{dao2022flashattention,dao2024flashattention2,shah2024flashattention3},
 which replaces the materialized $N \times N$ attention matrix with a
 single fused, tile-streaming kernel, and the \emph{mixed-precision
 attention} literature~\cite{micikevicius2022fp8,zhang2025sageattention3},
@@ -289,34 +289,39 @@ dispatch (Section~\ref{sec:exp}).
 
 \paragraph*{Attention kernel optimization} The original FlashAttention
 \cite{dao2022flashattention} introduced IO-aware tile streaming and
-online softmax; FlashAttention-2~\cite{dao2023flashattention2} refined
+online softmax; FlashAttention-2~\cite{dao2024flashattention2} refined
 work partitioning across warps; FlashAttention-3
 \cite{shah2024flashattention3} added Hopper-specific warp-specialized
 pipelining and producer-consumer asynchrony, plus FP8 support. The H3
 design relies on the Tensor Memory Accelerator (TMA), which is absent on
 consumer Blackwell~\cite{nvidia2025blackwell}; portions of the Hopper-
 specific optimization therefore do not transfer to sm\_120a.
-PagedAttention~\cite{kwon2023vllm} is a serving-system primitive built
-on top of these kernels; FlexAttention~\cite{he2024flexattention} is a
-programming model that compiles user-defined attention masks down to
-fused kernels via \texttt{torch.compile}. Our work targets the kernel
-itself, not the serving system. Rabe and
-Staats~\cite{rabe2021selfattention} preceded FlashAttention with the
-$O(N)$-memory algorithmic insight without a fused-kernel
-implementation.
+\emph{vAttention}~\cite{prabhu2024vattention} is an alternative
+serving-system memory manager that documents PagedAttention's decode-
+time regressions versus the FlashAttention-2 baseline---useful context
+for the SDPA-dispatch story we develop in
+Section~\ref{sec:exp}---and FlexAttention~\cite{dong2025flexattention}
+is a programming model that compiles user-defined attention masks down
+to fused kernels via \texttt{torch.compile}. Our work targets the
+kernel itself, not the serving system or the compiler stack. The
+official Triton fused-attention tutorial~\cite{tritonlang2025attention}
+gates its Blackwell branch on a \texttt{major == 10} runtime check that
+does not yet first-class consumer sm\_120a, illustrating the
+ecosystem-maturity gap our paper measures.
 
 \paragraph*{Mixed-precision attention} Micikevicius et
 al.~\cite{micikevicius2022fp8} introduced the E4M3 and E5M2 FP8 formats
-that the FP8 mma instructions consume, building on the broader mixed-
-precision-training framework~\cite{micikevicius2018mixed}. SageAttention3
-\cite{zhang2025sageattention3} is the closest related work to ours: it
-demonstrates an FP4 attention kernel on the RTX~5090 (Blackwell consumer
-flagship, sm\_120a) that engages the hardware-microscaled
-\texttt{mxf4nvf4} mma family with an NVFP4-standard 16-element block.
-Our V4 \emph{differs in three respects}: (i)~target hardware---we
-characterize the RTX~5080, an SKU with 19\% fewer SMs and a 384-bit
-versus 512-bit memory interface than the 5090; (ii)~instruction
-choice---we use the software-microscaled
+the FP8 mma instructions consume. SageAttention~\cite{zhang2025sageattention}
+established FP8 attention as a practical inference primitive on Hopper,
+outperforming FlashAttention-2 by $\approx 2.1\times$.
+SageAttention3~\cite{zhang2025sageattention3} is the closest related
+work to ours: it demonstrates an FP4 attention kernel on the RTX~5090
+(Blackwell consumer flagship, sm\_120a) that engages the hardware-
+microscaled \texttt{mxf4nvf4} mma family with an NVFP4-standard
+16-element block. Our V4 \emph{differs in three respects}:
+(i)~target hardware---we characterize the RTX~5080, an SKU with 19\%
+fewer SMs and a 384-bit versus 512-bit memory interface than the 5090;
+(ii)~instruction choice---we use the software-microscaled
 \texttt{kind::f8f6f4.m16n8k32} path with a 32-element block, because
 the hardware-microscaled mma's scattered-fragment layout is incompatible
 with the row-major-SMEM idiom shared with V3 (Section~\ref{sec:method});
@@ -328,20 +333,38 @@ SageAttention3's own observation that hardware microscaling matters; we
 make the cost concrete in the absence of that hardware path. We do not
 aim to outperform SageAttention3; we cite their FP4 throughput as the
 upper bound the hardware-microscaled path would deliver.
+SnapMLA~\cite{zhang2026snapmla} extends FP8 attention to long-context
+MLA decoding with per-component precision retention; the present paper
+operates on standard MHA, but the SnapMLA result is a useful indication
+that the per-tile vs.\ per-component precision-allocation lever
+generalizes beyond MHA.
 
 Recent work has also examined low-precision \emph{training} stability.
-Wang et al.~\cite{wang2025lowprecisionfails} attribute FP8/FP4 training
-divergence to specific optimizer-state overflow paths.
-Quantization-aware training for attention~\cite{xu2026attnqat} surfaces
-complementary inference-time failure modes. We focus exclusively on
-\emph{forward-pass inference}; both sources are useful in characterizing
-what FP4 attention can absorb numerically, but our error envelope
-(Section~\ref{sec:results}) is derived empirically rather than
-analytically.
+Qiu and Yao~\cite{qiu2025lowprecisionfails} attribute catastrophic
+loss explosion in low-precision flash attention training to the joint
+effect of low-rank representation collapse and compounding biased
+rounding errors. \emph{Attn-QAT}~\cite{zhang2026attnqat} provides the
+first systematic study of 4-bit QAT for attention, showing that the
+natural ``FP4 forward + high-precision Flash backward'' recipe is
+unstable and identifying matched-precision recomputation as the
+necessary stability principle. We focus exclusively on
+\emph{forward-pass inference}; both training-stability sources
+nevertheless help characterize what FP4 attention can absorb
+numerically, and our error envelope (Section~\ref{sec:results}) is
+consistent with the inference-side picture they imply.
+
+\paragraph*{KV-cache quantization (orthogonal axis)} A separate line of
+work pushes the KV cache to 4-, 3-, and 2-bit
+representations~\cite{liu2024kivi,hooper2024kvquant} for long-context
+inference. KV quantization is orthogonal to our axis: it changes the
+\emph{stored} representation between attention layers, while we change
+the \emph{computed} representation inside a single attention call.
+Combining the two on consumer Blackwell is a clear future-work
+direction.
 
 \paragraph*{Reproducibility and hardware-transfer studies} Pineau et
-al.~\cite{pineau2020reproducibility} document reproducibility failures
-in machine learning research; Desai et al.~\cite{desai2024taxonomy}
+al.~\cite{pineau2021reproducibility} document reproducibility failures
+in machine learning research; Desai et al.~\cite{desai2025reproducibility}
 provide a taxonomy specific to AI/ML systems work. Kalibera and
 Jones~\cite{kalibera2013rigorous} and van der Kouwe et
 al.~\cite{vanderkouwe2018benchmarkingcrimes} catalogue methodological
@@ -635,6 +658,17 @@ that this is a Windows-PyTorch-stack-specific finding, not a Linux-
 production result. We attempted to pin the dispatch to
 \texttt{FLASH\_ATTENTION} and \texttt{CUDNN\_ATTENTION} via
 \texttt{torch.nn.attention.sdpa\_kernel}; both were rejected at runtime.
+The vLLM project~\cite{vllm2025issue14452} explicitly documents that
+the FA3 backend does not yet work with consumer
+Blackwell~\cite{vllm2025issue29030} (SM~12.0 is not a superset of
+SM~10.0); the NVIDIA Transformer Engine test
+suite~\cite{te2025issue2186} maintains an FP8-attention skip list (THD
+layout, bias, sliding window, MLA-CP); FlashInfer FP8 attention has a
+documented Blackwell correctness regression~\cite{vllm2026issue35138}
+that recommends a backend switch rather than a precision change. Our
+SDPA-dispatches-to-MATH finding is one observation in a larger pattern
+of consumer-Blackwell-attention-stack-immaturity that the broader
+ecosystem has been independently surfacing.
 
 \paragraph*{Tensor Core engagement} Rather than rely on Nsight Compute
 metrics (gated by \texttt{ERR\_NVGPUCTRPERM} on consumer GPUs without
@@ -925,8 +959,17 @@ consumer Blackwell SKU (RTX~5080, sm\_120a). The V4 result is most
 sensitive to the unavailability of \texttt{mxf4nvf4} via row-major
 SMEM; on a setup that links a CUTLASS-built attention kernel through
 the hardware-microscaled path, we would expect V4 to flip from
-``slower than V3'' to ``faster than V3''. Replication on the RTX~5090
-(same sm\_120a target, larger compute) is left as future work.
+``slower than V3'' to ``faster than V3''. The recent
+\emph{SlideSparse}~\cite{shao2026slidesparse} consumer-Blackwell
+sparse-GEMM evaluation explicitly includes RTX~5080 alongside the
+5090, A100, H100, B200, and DGX~Spark and demonstrates that the cross-
+SKU comparisons are tractable; a comparable replication on the
+attention axis is left as future work. Notably, the recent
+Knoop-Holtmann consumer-Blackwell LLM-deployment
+study~\cite{knoop2026consumerllm} \emph{omits the RTX~5080 entirely},
+covering 5060~Ti, 5070~Ti, and 5090 only---leaving the present paper
+as the only kernel-level attention study on the SKU at the time of
+writing.
 
 \paragraph*{Single inference scenario} Forward pass only. The backward
 pass is non-trivial for the narrow-precision variants and out of scope.
@@ -936,13 +979,16 @@ masking, paged KV caches, or heterogeneous batches.
 
 \paragraph*{Driver and software-version sensitivity} Our results are
 specific to PyTorch~2.9.1+cu128 on Windows~11 with the driver versions
-recorded in the artifact's Parquet provenance. PyTorch issue trackers
-(see Appendix~\ref{app:repro}) document several attention-dispatch
-regressions and precision-sensitivity bugs on consumer Blackwell over
-mid-2026; readers attempting to replicate on a different stack should
-expect minor numerical and dispatch divergences. We freeze the
-versions in our artifact and report measured behavior on those exact
-versions.
+recorded in the artifact's Parquet provenance. The
+vLLM~\cite{vllm2025issue14452,vllm2025issue29030,vllm2025issue30707},
+NVIDIA TransformerEngine~\cite{te2025issue2186}, and
+FlashInfer~\cite{vllm2026issue35138} issue trackers document a
+sustained pattern of attention-dispatch regressions, FP8/NVFP4
+precision-sensitivity bugs, and pre-flight-validation false negatives
+on consumer Blackwell over mid-2026; readers attempting to replicate
+on a different stack should expect minor numerical and dispatch
+divergences. We freeze the versions in our artifact and report
+measured behavior on those exact versions.
 
 \paragraph*{Memory ceiling} The 16~GB card means V0 OOMs past
 seq\_len$=2048$ at our (batch, heads); V1 OOMs past $\sim 8192$; V2/V3/V4
