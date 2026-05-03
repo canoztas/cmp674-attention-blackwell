@@ -1,0 +1,19 @@
+# Default V0 sweep. The harness expands the lists under `configs:` as a
+# cartesian product; scalars are auto-promoted to single-element lists.
+#
+# Sized so that V0's N x N materialization fits easily on a 16 GB RTX 5080:
+# the largest config below is batch=4, num_heads=16, seq_len=2048, fp32,
+# which yields a peak intermediate of 4 * 16 * 2048 * 2048 * 4 B ≈ 1.0 GiB.
+
+sweep:
+  name: v0_initial
+  num_warmup: 25
+  num_iter: 100
+  input_seed: 0
+  configs:
+    seq_len: [128, 512, 1024, 2048]
+    head_dim: [64, 128]
+    batch_size: [4]
+    num_heads: [16]
+    dtype: ["torch.float32"]
+    causal: [false]

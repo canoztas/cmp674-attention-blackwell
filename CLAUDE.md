@@ -134,9 +134,29 @@ python analysis/plot_v0_initial.py
 
 ## Current status
 
-**Session 1 — in progress.** Repo skeleton in place. Toolchain validation
-(`env/check_env.py`) written and awaiting first run. After it passes cleanly, the next
-session steps are: benchmark harness, V0-PT reference, V0-CU custom kernel, correctness
-tests, first benchmark sweep + figure.
+**Session 1 — V0 complete.** Toolchain end-to-end green: VS Build Tools 2022 (MSVC
+14.44) + CUDA Toolkit 12.8 + Nsight Compute 2025.1.1 installed and on PATH;
+`env/check_env.py` reports 10/10 PASS; V0-CU kernel (`kernels/v0_naive_fp32/`) builds
+for sm_120 via `pip install -e`; 147/147 pytest tests pass (V0-CU vs V0-PT atol=1e-5,
+both vs F.scaled_dot_product_attention atol=1e-4); first sweep produced 2400 rows in
+[bench/results/v0_initial.parquet](bench/results/v0_initial.parquet) (24 (variant,
+config) results × 100 iterations) and the precursor figure at
+[analysis/figures/v0_initial.png](analysis/figures/v0_initial.png).
+
+Notable Windows-specific gotchas resolved this session, captured for V1+ sessions:
+- `pip install` C++ extensions: pass `--no-build-isolation` and set
+  `DISTUTILS_USE_SDK=1` whenever vcvarsall is pre-sourced.
+- MSVC 14.40+ + torch 2.9 needs `-DUSE_CUDA` in both cxx and nvcc flags to dodge
+  `C2872 'std' ambiguous` from `compiled_autograd.h` (PyTorch PR #144707).
+- Use `/O2` (not `-O3`) as the cxx host flag on Windows.
+- Use `C10_CUDA_CHECK` from `<c10/cuda/CUDAException.h>` (not `AT_CUDA_CHECK`).
+- Block-level reductions in shared memory need `__syncthreads()` AFTER reading the
+  reduced value if the same buffer is reused for a subsequent reduction — without it,
+  fast threads can overwrite the reduction result before slow threads have read it
+  (cause of a one-row-per-launch nondeterministic numerical bug fixed mid-session).
+
+**Next session — V1.** FP16 tiled with WMMA / CUTLASS, still materializing outputs.
+First action of the V1 session: install CUTLASS, decide between hand-rolled WMMA
+and CUTLASS templates for the two matmuls.
 
 Update this section at the end of every session.
