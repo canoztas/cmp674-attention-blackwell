@@ -22,16 +22,7 @@ dist/
 bench/results/*.parquet
 bench/results/*.log
 
-# LaTeX build artifacts (paper/main.pdf and slides/lesson.pdf ARE committed)
-paper/main.aux
-paper/main.bbl
-paper/main.blg
-paper/main.fdb_latexmk
-paper/main.fls
-paper/main.log
-paper/main.out
-paper/main.toc
-paper/main.synctex.gz
+# LaTeX build artifacts for slides (slides/lesson.pdf IS committed)
 slides/lesson.aux
 slides/lesson.fdb_latexmk
 slides/lesson.fls
@@ -51,6 +42,7 @@ slides/lesson_preview*.png
 # Notebooks
 .ipynb_checkpoints/
 
-# Claude Code artifacts (kept local, not pushed)
+# Local-only files (kept off the remote)
 CLAUDE.md
 .claude/
+paper/

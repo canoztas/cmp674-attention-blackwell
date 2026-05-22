@@ -5,7 +5,7 @@ Usage:
 
 Defaults:
     --input bench/results/sweep_final.parquet (fallback bench/results/v4_initial.parquet)
-    --outdir paper/figures
+    --outdir figures
 
 Each figure is written as both .pdf (vector, used by the paper) and
 .png (preview, useful for quick browsing). Figure styling targets IEEE
@@ -38,7 +38,7 @@ logger = logging.getLogger("paper_figures")
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_INPUT = REPO_ROOT / "bench" / "results" / "sweep_final.parquet"
 FALLBACK_INPUT = REPO_ROOT / "bench" / "results" / "v4_initial.parquet"
-DEFAULT_OUTDIR = REPO_ROOT / "paper" / "figures"
+DEFAULT_OUTDIR = REPO_ROOT / "figures"
 
 VARIANT_LABEL = {
     "v0_naive_pt":  "V0 (FP32 naive, PyTorch)",
